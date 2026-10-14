@@ -1,0 +1,9 @@
+[submodule "YouTube/Clipping/NouClip"]
+	path = YouTube/Clipping/NouClip
+	url = https://github.com/nouverse/nouclip.git
+[submodule "YouTube/Clipping/yt-dlp"]
+	path = YouTube/Clipping/yt-dlp
+	url = https://github.com/yt-dlp/yt-dlp.git
+[submodule "YouTube/Clipping/whisper"]
+	path = YouTube/Clipping/whisper
+	url = https://github.com/openai/whisper.git
