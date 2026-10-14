@@ -7,3 +7,6 @@
 [submodule "YouTube/Clipping/whisper"]
 	path = YouTube/Clipping/whisper
 	url = https://github.com/openai/whisper.git
+[submodule "YouTube/Clipping/FFmpeg"]
+	path = YouTube/Clipping/FFmpeg
+	url = https://github.com/FFmpeg/FFmpeg.git
