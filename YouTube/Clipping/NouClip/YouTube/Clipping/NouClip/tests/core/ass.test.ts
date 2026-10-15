@@ -1,0 +1,209 @@
+import { describe, expect, it } from 'bun:test';
+import { ASSGenerator, type WordTimestamp } from '@/core/ass';
+
+const words: WordTimestamp[] = [
+  { word: 'Halo', start: 0.0, end: 0.4, probability: 0.99 },
+  { word: 'ini', start: 0.45, end: 0.8, probability: 0.98 },
+  { word: 'test', start: 0.85, end: 1.4, probability: 0.99 }
+];
+
+describe('ASSGenerator.formatTime', () => {
+  it('formats H:MM:SS.cc', () => {
+    expect(ASSGenerator.formatTime(0)).toBe('0:00:00.00');
+    expect(ASSGenerator.formatTime(65.432)).toBe('0:01:05.43');
+    expect(ASSGenerator.formatTime(3661.05)).toBe('1:01:01.05');
+  });
+
+  it('clamps invalid values to zero', () => {
+    expect(ASSGenerator.formatTime(-4)).toBe('0:00:00.00');
+    expect(ASSGenerator.formatTime(Number.NaN)).toBe('0:00:00.00');
+  });
+});
+
+describe('ASSGenerator.sanitizeWords', () => {
+  it('drops blank words and unusable timings', () => {
+    const cleaned = ASSGenerator.sanitizeWords([
+      { word: 'ok', start: 0, end: 1 },
+      { word: '   ', start: 1, end: 2 },
+      { word: 'nan', start: Number.NaN, end: 2 },
+      { word: 'inf', start: 0, end: Number.POSITIVE_INFINITY }
+    ]);
+    expect(cleaned.map((w) => w.word)).toEqual(['ok']);
+  });
+
+  it('attaches standalone punctuation to the previous word and extends its timing', () => {
+    const cleaned = ASSGenerator.sanitizeWords([
+      { word: 'bahwa', start: 0, end: 0.5 },
+      { word: ',', start: 0.5, end: 0.8 },
+      { word: 'jika', start: 0.9, end: 1.2 }
+    ]);
+    expect(cleaned).toEqual([
+      { word: 'bahwa,', start: 0, end: 0.8 },
+      { word: 'jika', start: 0.9, end: 1.2 }
+    ]);
+  });
+
+  it('discards leading standalone punctuation when there is no preceding word', () => {
+    const cleaned = ASSGenerator.sanitizeWords([
+      { word: ',', start: 0, end: 0.2 },
+      { word: 'Saya', start: 0.3, end: 0.7 }
+    ]);
+    expect(cleaned.map((w) => w.word)).toEqual(['Saya']);
+  });
+});
+
+describe('ASSGenerator.groupWords', () => {
+  it('chunks words up to the group size', () => {
+    const groups = ASSGenerator.groupWords(words, 2, 0.4);
+    expect(groups.map((g) => g.map((w) => w.word))).toEqual([['Halo', 'ini'], ['test']]);
+  });
+
+  it('breaks a group early on a long silence', () => {
+    const withPause: WordTimestamp[] = [
+      { word: 'a', start: 0, end: 0.4 },
+      { word: 'b', start: 3.0, end: 3.4 }
+    ];
+    expect(ASSGenerator.groupWords(withPause, 2, 0.4)).toHaveLength(2);
+  });
+
+  it('breaks a group early on terminal punctuation with trailing quotes or brackets', () => {
+    const withPunctuation: WordTimestamp[] = [
+      { word: 'selesai."', start: 0, end: 0.4 },
+      { word: 'Lanjut', start: 0.5, end: 0.9 },
+      { word: 'lagi', start: 1.0, end: 1.4 }
+    ];
+    const groups = ASSGenerator.groupWords(withPunctuation, 3, 0.4);
+    expect(groups).toHaveLength(2);
+    expect(groups[0].map((w) => w.word)).toEqual(['selesai."']);
+    expect(groups[1].map((w) => w.word)).toEqual(['Lanjut', 'lagi']);
+  });
+
+  it('consumes every word exactly once', () => {
+    const many = Array.from({ length: 9 }, (_, i) => ({
+      word: `w${i}`,
+      start: i * 0.5,
+      end: i * 0.5 + 0.4
+    }));
+    const flat = ASSGenerator.groupWords(many, 4, 0.4).flat();
+    expect(flat.map((w) => w.word)).toEqual(many.map((w) => w.word));
+  });
+});
+
+describe('ASSGenerator.groupWords at a splice', () => {
+  // Spliced words sit close together across a cut, so neither the gap nor the punctuation
+  // rule would break the caption there; the segment tag does.
+  const spliced: WordTimestamp[] = [
+    { word: 'hook', start: 0, end: 0.4, segment: 0 },
+    { word: 'line', start: 0.45, end: 0.9, segment: 0 },
+    { word: 'setup', start: 0.95, end: 1.3, segment: 1 },
+    { word: 'starts', start: 1.35, end: 1.8, segment: 1 }
+  ];
+
+  it('never lets a caption span two spliced segments', () => {
+    const groups = ASSGenerator.groupWords(spliced, 3, 0.4);
+    expect(groups.map((g) => g.map((w) => w.word))).toEqual([
+      ['hook', 'line'],
+      ['setup', 'starts']
+    ]);
+  });
+
+  it('groups untagged words as before', () => {
+    const untagged = spliced.map(({ segment: _segment, ...w }) => w);
+    expect(ASSGenerator.groupWords(untagged, 3, 0.4).map((g) => g.length)).toEqual([3, 1]);
+  });
+
+  it('ends a standard-style phrase at a splice too', () => {
+    const dialogues = ASSGenerator.generateKineticASS(spliced, { style: 'standard' })
+      .split('\n')
+      .filter((l) => l.startsWith('Dialogue:'));
+    expect(dialogues).toHaveLength(2);
+    expect(dialogues[0]).toContain('hook line');
+    expect(dialogues[1]).toContain('setup starts');
+  });
+});
+
+describe('ASSGenerator.generateKineticASS', () => {
+  it('produces a valid script structure', () => {
+    const ass = ASSGenerator.generateKineticASS(words, { fontSize: 64 });
+
+    expect(ass).toContain('[Script Info]');
+    expect(ass).toContain('PlayResX: 1080');
+    expect(ass).toContain('PlayResY: 1920');
+    expect(ass).toContain('[V4+ Styles]');
+    expect(ass).toContain('[Events]');
+    expect(ass).toContain('Dialogue:');
+    expect(ass).toContain('Arial Black, 64');
+    expect(ass.endsWith('\n')).toBe(true);
+  });
+
+  it('supports typography presets (hormozi, storyteller, cinematic)', () => {
+    const hormoziAss = ASSGenerator.generateKineticASS(words, { style: 'hormozi' });
+    expect(hormoziAss).toContain('Arial Black');
+    expect(hormoziAss).toContain('&H0000FF00'); // Neon green highlight
+    expect(hormoziAss).toContain('HALO');
+
+    const storytellerAss = ASSGenerator.generateKineticASS(words, { style: 'storyteller' });
+    expect(storytellerAss).toContain('Arial');
+    expect(storytellerAss).toContain('&H0050E3C2'); // Cyan highlight
+    expect(storytellerAss).toContain('Halo'); // Natural case
+
+    const cinematicAss = ASSGenerator.generateKineticASS(words, { style: 'cinematic' });
+    expect(cinematicAss).toContain('Trebuchet MS');
+    expect(cinematicAss).toContain('&H0000A5FF'); // Golden amber
+  });
+
+  it('emits one dialogue line per word so each word can be highlighted', () => {
+    const dialogues = ASSGenerator.generateKineticASS(words)
+      .split('\n')
+      .filter((l) => l.startsWith('Dialogue:'));
+    expect(dialogues).toHaveLength(words.length);
+    expect(dialogues[0]).toContain('HALO');
+  });
+
+  it('caps the trailing word so captions do not linger through a pause', () => {
+    const lingering: WordTimestamp[] = [{ word: 'solo', start: 10, end: 40 }];
+    const line = ASSGenerator.generateKineticASS(lingering, { maxWordDuration: 1 })
+      .split('\n')
+      .find((l) => l.startsWith('Dialogue:')) as string;
+
+    expect(line).toContain('0:00:10.00,0:00:11.00');
+  });
+
+  it('gives zero-length words a minimum visible duration', () => {
+    const line = ASSGenerator.generateKineticASS([{ word: 'x', start: 5, end: 5 }])
+      .split('\n')
+      .find((l) => l.startsWith('Dialogue:')) as string;
+
+    expect(line).toContain('0:00:05.00,0:00:05.30');
+  });
+
+  it('strips brace characters that would break ASS override tags', () => {
+    const ass = ASSGenerator.generateKineticASS([{ word: '{evil}', start: 0, end: 1 }]);
+    expect(ass).toContain('EVIL');
+    expect(ass).not.toContain('{EVIL}');
+  });
+
+  it('handles an empty transcript without emitting dialogue', () => {
+    const ass = ASSGenerator.generateKineticASS([]);
+    expect(ass).toContain('[Events]');
+    expect(ass).not.toContain('Dialogue:');
+  });
+
+  it('supports noScale option to eliminate libass scale jitter while keeping kinetic color highlight', () => {
+    const ass = ASSGenerator.generateKineticASS(words, { noScale: true });
+    expect(ass).toContain('Dialogue:');
+    expect(ass).toContain('&H0000FFFF'); // Active highlight color
+    expect(ass).not.toContain('\\fscx'); // Zero scale distortion
+    expect(ass).not.toContain('\\t('); // Zero transform jitter
+  });
+
+  it('supports standard preset with clean sentence/phrase grouping without kinetic tags', () => {
+    const ass = ASSGenerator.generateKineticASS(words, { style: 'standard' });
+    expect(ass).toContain('[Script Info]');
+    expect(ass).toContain('Dialogue:');
+    expect(ass).toContain('Halo ini test');
+    expect(ass).toContain('&H0000FFFF'); // Cinema Yellow
+    expect(ass).not.toContain('\\fscx'); // No zoom animation tags
+    expect(ass).not.toContain('\\t('); // No transform tags
+  });
+});

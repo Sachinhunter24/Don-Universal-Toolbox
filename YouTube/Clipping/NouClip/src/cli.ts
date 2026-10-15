@@ -1,0 +1,320 @@
+#!/usr/bin/env node
+import { autoCommand } from '@/commands/auto';
+import { cropCommand } from '@/commands/crop';
+import { cutCommand } from '@/commands/cut';
+import { downloadCommand } from '@/commands/download';
+import { extractCommand } from '@/commands/extract';
+import { highlightCommand } from '@/commands/highlight';
+import { infoCommand } from '@/commands/info';
+import { listCommand } from '@/commands/list';
+import { stitchCommand } from '@/commands/stitch';
+import { subtitleCommand } from '@/commands/subtitle';
+import { transcriptCommand } from '@/commands/transcript';
+import { getErrorMessage, getExitCode } from '@/utils/errors';
+import { logger } from '@/utils/logger';
+import { VERSION } from '@/version';
+import { Command } from 'commander';
+
+/**
+ * Wraps a command handler so every failure is reported and exits consistently.
+ * Commands themselves throw (usually `CliError`) instead of calling process.exit.
+ */
+function action<A extends unknown[]>(handler: (...args: A) => unknown | Promise<unknown>) {
+  return async (...args: A): Promise<void> => {
+    try {
+      await handler(...args);
+    } catch (err) {
+      logger.error(getErrorMessage(err));
+      process.exitCode = getExitCode(err);
+    }
+  };
+}
+
+/**
+ * `--timeline` / `--skip` and their aliases: several ranges spliced in the order written, and
+ * windows cut out of the selection. `auto`, `cut` and `stitch` take them on top of `--range`.
+ */
+function withTimelineOptions(command: Command): Command {
+  return command
+    .option(
+      '--timeline <segments>',
+      'Segments to splice, in this order e.g. "1:30-1:35 + 0:00-0:15 + 0:25-0:50"'
+    )
+    .option('--ranges <segments>', 'Alias for --timeline')
+    .option(
+      '--timeline-file <path>',
+      'JSON list of segments e.g. [{ "start": "01:30", "end": "01:35", "tag": "hook" }]'
+    )
+    .option('--skip <windows>', 'Windows to cut out of the selection e.g. "0:06-0:14, 1:10-1:20"')
+    .option('--exclude <windows>', 'Alias for --skip');
+}
+
+const program = new Command();
+
+program
+  .name('nouclip')
+  .description('Agentic video clipper, aspect ratio reframer & kinetic subtitle engine')
+  .version(VERSION)
+  .showHelpAfterError();
+
+// 1. Storage & Context Introspection Commands
+program
+  .command('info')
+  .alias('paths')
+  .description('Display workspace paths, stored asset counts, storage size, and service config')
+  .option('--json', 'Output results as JSON payload')
+  .action(action(infoCommand));
+
+program
+  .command('list [type]')
+  .alias('ls')
+  .description(
+    'List stored assets (types: "downloads", "transcripts", "segments", "output", "all")'
+  )
+  .option('--json', 'Output list as JSON payload')
+  .action(action(listCommand));
+
+// 2. End-to-End Pipeline
+const auto = program
+  .command('auto <videoOrUrl>')
+  .description(
+    'End-to-end automated clipping: download -> cut range or splice timeline -> aspect reframing -> Whisper -> kinetic subtitles'
+  )
+  .option('-r, --range <range>', 'Time range e.g. "13:25-14:50", "01:20..02:15", "45-75"')
+  .option('-s, --start <time>', 'Start timestamp e.g. "13:25", "01:13:25", "85s"')
+  .option('--from <time>', 'Alias for --start')
+  .option('-e, --end <time>', 'End timestamp e.g. "14:50", "01:15:00"')
+  .option('--to <time>', 'Alias for --end')
+  .option('-d, --duration <time>', 'Duration e.g. "30s", "1m", "45"');
+
+withTimelineOptions(auto)
+  .option(
+    '-a, --aspect <ratio>',
+    'Aspect ratio e.g. "9:16", "1:1", "4:5", "16:9" (default: "9:16")',
+    '9:16'
+  )
+  .option(
+    '-m, --mode <mode>',
+    'Framing style: "blur" (blurred background), "center" (crop fill), "pad" (letterbox), "stretch" (default: "blur")',
+    'blur'
+  )
+  .option('--blur', 'Shortcut for --mode blur (blurred background letterbox)')
+  .option('--center', 'Shortcut for --mode center (crop fill)')
+  .option('--no-subtitles', 'Do not generate or burn subtitles (clean reframed video only)')
+  .option('--no-subs', 'Alias for --no-subtitles')
+  .option('--no-subtitle', 'Alias for --no-subtitles')
+  .option('-l, --lang <lang>', "Spoken language, for captions and Whisper (default: 'id')", 'id')
+  .option(
+    '--captions <mode>',
+    "YouTube captions: 'auto' uses them before Whisper, 'only' never transcribes, 'off' always transcribes (default: 'auto')",
+    'auto'
+  )
+  .option(
+    '--style <preset>',
+    'Subtitle typography style preset: "default", "hormozi", "storyteller", "cinematic", "standard" (default: "default")',
+    'default'
+  )
+  .option('--font-size <size>', 'Subtitle font size (overrides the --style preset size)')
+  .option('--primary-color <hex>', 'Inactive text color e.g. "&H00FFFFFF&" (overrides the preset)')
+  .option(
+    '--highlight-color <hex>',
+    'Active animated word color e.g. "&H0000FFFF&" (overrides the preset)'
+  )
+  .option('--silence-trim', 'Auto-trim silent pauses (>0.6s) between words for faster pacing')
+  .option(
+    '--silence-gap <seconds>',
+    'Silence threshold in seconds before trimming (default: 0.6)',
+    '0.6'
+  )
+  .option('--bgm <path>', 'Background music track to mix with sidechain ducking')
+  .option('--bgm-volume <volume>', 'BGM audio volume factor (default: 0.10)', '0.10')
+  .option('--no-ducking', 'Disable sidechain audio ducking (constant volume BGM mix)')
+  .option(
+    '--no-scale',
+    'Disable kinetic pop scaling animation to eliminate vertical line-height jitter'
+  )
+  .option(
+    '--draft',
+    'Generate segment, audio, and subtitle files but pause before burning for review'
+  )
+  .option('--no-burn', 'Alias for --draft')
+  .option('-o, --output <path>', 'Output video path')
+  .option('--download-dir <dir>', 'Custom directory to store downloaded videos')
+  .option('--output-dir <dir>', 'Custom directory to store final videos')
+  .option('--force', 'Force re-download even if already cached')
+  .option('--keep-temp', 'Keep intermediate wav/temp files')
+  .option(
+    '--js-runtimes <runtime>',
+    'Additional JavaScript runtime for yt-dlp e.g. "node:node" or "deno"'
+  )
+  .action(action(autoCommand));
+
+// 3. Modular Operations
+program
+  .command('download <url>')
+  .description('Download video or section from YouTube via yt-dlp with caching support')
+  .option('-s, --start <time>', 'Start timestamp e.g. "13:25", "85s"')
+  .option('-e, --end <time>', 'End timestamp e.g. "14:50"')
+  .option('-o, --output <filename>', 'Output filename template')
+  .option('--dir <directory>', 'Output download directory')
+  .option('--force', 'Force re-download even if already cached')
+  .option(
+    '--js-runtimes <runtime>',
+    'Additional JavaScript runtime for yt-dlp e.g. "node:node" or "deno"'
+  )
+  .action(action(downloadCommand));
+
+const cut = program
+  .command('cut <video>')
+  .description(
+    'Cut a video segment by timestamp range without re-encoding (or with re-encode), or splice several ranges'
+  )
+  .option('-r, --range <range>', 'Time range e.g. "13:25-14:50", "80-110"')
+  .option('-s, --start <time>', 'Start time e.g. "13:25", "85s"')
+  .option('--from <time>', 'Alias for --start')
+  .option('-e, --end <time>', 'End time e.g. "14:50"')
+  .option('--to <time>', 'Alias for --end')
+  .option('-d, --duration <time>', 'Duration e.g. "30s", "45"');
+
+withTimelineOptions(cut)
+  .option('-o, --output <path>', 'Output MP4 path')
+  .option(
+    '--reencode',
+    'Re-encode video with libx264 (default: false fast copy; --timeline and --skip always re-encode)'
+  )
+  .action(action(cutCommand));
+
+const stitch = program
+  .command('stitch <video>')
+  .description(
+    'Splice several ranges of one video into one clip, in the order given, and re-time its word timestamps to match'
+  )
+  .option('-r, --range <range>', 'Base range to cut --skip windows out of e.g. "0:00-1:30"')
+  .option('-s, --start <time>', 'Start of the base range e.g. "13:25", "85s"')
+  .option('--from <time>', 'Alias for --start')
+  .option('-e, --end <time>', 'End of the base range e.g. "14:50"')
+  .option('--to <time>', 'Alias for --end')
+  .option('-d, --duration <time>', 'Duration of the base range e.g. "30s", "45"');
+
+withTimelineOptions(stitch)
+  .option(
+    '--subtitles <json>',
+    'Word timestamps JSON of the source video (e.g. its .whisper.json) to re-time onto the stitched clip'
+  )
+  .option(
+    '--output-subtitles <json>',
+    'Where to write the re-timed JSON (default: <workspace>/transcripts/<output name>.whisper.json)'
+  )
+  .option('-o, --output <path>', 'Output MP4 path')
+  .action(action(stitchCommand));
+
+program
+  .command('crop <video>')
+  .alias('reframe')
+  .description('Reframe video aspect ratio (9:16, 1:1, 4:5, 16:9) with blur, center, or pad modes')
+  .option(
+    '-a, --aspect <ratio>',
+    'Target aspect ratio e.g. "9:16", "1:1", "4:5", "16:9" (default: "9:16")',
+    '9:16'
+  )
+  .option(
+    '-m, --mode <mode>',
+    'Framing style: "blur" (blurred background), "center" (crop), "pad" (letterbox), "stretch" (default: "blur")',
+    'blur'
+  )
+  .option('--blur', 'Shortcut for --mode blur')
+  .option('--center', 'Shortcut for --mode center (crop fill)')
+  .option('-o, --output <path>', 'Output MP4 path')
+  .action(action(cropCommand));
+
+program
+  .command('extract <video>')
+  .description('Extract audio from video and run Whisper to generate word timestamps JSON')
+  .option('-r, --range <range>', 'Limit extraction to a range e.g. "13:25-14:50"')
+  .option('-s, --start <time>', 'Start time e.g. "13:25", "85s"')
+  .option('--from <time>', 'Alias for --start')
+  .option('-e, --end <time>', 'End time e.g. "14:50"')
+  .option('--to <time>', 'Alias for --end')
+  .option('-d, --duration <time>', 'Duration e.g. "30s", "45"')
+  .option('-l, --lang <lang>', "Transcription language (default: 'id')", 'id')
+  .option('-m, --model <model>', "Whisper model name (default: 'large-v3')", 'large-v3')
+  .option('--keep-wav', 'Keep the intermediate WAV file')
+  .option('-o, --output <path>', 'Output JSON path')
+  .action(action(extractCommand));
+
+program
+  .command('transcript <videoOrJsonOrUrl>')
+  .description(
+    'Export a timed transcript (TXT, SRT, VTT, JSON) of a file or a YouTube link — from its captions when it has them'
+  )
+  .option('-r, --range <range>', 'Only this range e.g. "13:25-14:50" (times then start at zero)')
+  .option('-s, --start <time>', 'Start timestamp')
+  .option('--from <time>', 'Alias for --start')
+  .option('-e, --end <time>', 'End timestamp')
+  .option('--to <time>', 'Alias for --end')
+  .option('-d, --duration <time>', 'Duration')
+  .option(
+    '--captions <mode>',
+    "YouTube captions: 'auto' uses them before Whisper, 'only' never transcribes, 'off' always transcribes (default: 'auto')",
+    'auto'
+  )
+  .option(
+    '-f, --format <format>',
+    "Export format: 'txt', 'srt', 'vtt', 'json' (default: 'txt')",
+    'txt'
+  )
+  .option('-l, --lang <lang>', "Transcription language (default: 'id')", 'id')
+  .option('-o, --output <path>', 'Output file path')
+  .action(action(transcriptCommand));
+
+program
+  .command('subtitle <video>')
+  .description('Burn animated kinetic subtitles into video from .ass file or .json word timestamps')
+  .option('-s, --sub <path>', 'Path to .ass subtitle file or .json word timestamps')
+  .option('-t, --timestamps <json>', 'Path to Whisper word timestamps JSON (alias for --sub)')
+  .option(
+    '--style <preset>',
+    'Subtitle typography style preset: "default", "hormozi", "storyteller", "cinematic", "standard" (default: "default")',
+    'default'
+  )
+  .option('--font-size <size>', 'Font size (overrides the --style preset size)')
+  .option('--primary-color <hex>', 'Inactive text color (overrides the preset)')
+  .option('--highlight-color <hex>', 'Active animated word color (overrides the preset)')
+  .option('--bgm <path>', 'Background music track to mix with sidechain ducking')
+  .option('--bgm-volume <volume>', 'BGM audio volume factor (default: 0.10)', '0.10')
+  .option('--no-ducking', 'Disable sidechain audio ducking (constant volume BGM mix)')
+  .option(
+    '--no-scale',
+    'Disable kinetic pop scaling animation to eliminate vertical line-height jitter'
+  )
+  .option('-o, --output <path>', 'Output MP4 path')
+  .action(action(subtitleCommand));
+
+program
+  .command('highlight <videoOrJsonOrUrl>')
+  .description(
+    'Suggest clip timestamps from a transcript, a video, or a YouTube link (its captions when it has them)'
+  )
+  .option('-l, --lang <lang>', "Spoken language, for captions and Whisper (default: 'id')", 'id')
+  .option(
+    '--captions <mode>',
+    "YouTube captions: 'auto' uses them before Whisper, 'only' never transcribes, 'off' always transcribes (default: 'auto')",
+    'auto'
+  )
+  .option('-k, --keyword <keyword>', 'Focus highlight search on specific keyword / topic')
+  .option(
+    '-m, --max-clips <count>',
+    'Maximum number of highlight clips to generate (default: 5)',
+    '5'
+  )
+  .option('--min-duration <seconds>', 'Minimum clip duration in seconds (default: 25)', '25')
+  .option('--max-duration <seconds>', 'Maximum clip duration in seconds (default: 60)', '60')
+  .option(
+    '--budget <seconds>',
+    'Total duration target across all suggested clips (default: 180)',
+    '180'
+  )
+  .option('-o, --output <path>', 'Output JSON file to save suggested highlight clips')
+  .action(action(highlightCommand));
+
+program.parse(process.argv);

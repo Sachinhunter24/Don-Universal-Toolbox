@@ -1,0 +1,51 @@
+name: CI Quality Gate
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Typecheck, Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Verify FFmpeg is available
+        # Integration tests self-skip without it; fail loudly instead so the
+        # ffmpeg-backed suite never silently stops running in CI.
+        run: ffmpeg -version && ffprobe -version
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Lint & Format Check
+        run: bun run lint
+
+      - name: Unit & Integration Tests
+        run: bun test
+
+      - name: Build
+        run: bun run build:js

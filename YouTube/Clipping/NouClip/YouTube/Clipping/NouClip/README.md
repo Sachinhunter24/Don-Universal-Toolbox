@@ -1,0 +1,372 @@
+# 🎬 NouClip — Agentic Video Clipper & Shorts Engine
+
+[![Bun](https://img.shields.io/badge/Bun-1.1+-fbf0df.svg?logo=bun&logoColor=black)](https://bun.sh)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.7+-blue.svg?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
+[![FFmpeg](https://img.shields.io/badge/FFmpeg-6.0+-007808.svg?logo=ffmpeg&logoColor=white)](https://ffmpeg.org)
+[![OpenAI Whisper](https://img.shields.io/badge/OpenAI_Whisper-Large--v3-blue.svg)](https://github.com/openai/whisper)
+[![Release](https://img.shields.io/github/v/release/nouverse/nouclip?color=purple&label=Download%20CLI)](https://github.com/nouverse/nouclip/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Sponsor](https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-ea4aaa.svg?logo=github-sponsors)](https://github.com/sponsors/gadingnst)
+[![Trakteer](https://img.shields.io/badge/Trakteer-Dukung%20Kreator-red.svg)](https://trakteer.id/gadingnst)
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-Buy%20a%20Coffee-29abe0.svg?logo=ko-fi)](https://ko-fi.com/gadingnst)
+
+An **agentic-first CLI tool** for video cutting, aspect ratio reframing, Whisper transcription, animated kinetic subtitles, smart audio ducking, and auto silence trimming.
+
+Designed for automated workflows, AI agent harnesses, and power users who need deterministic, scriptable video operations with persistent artifact caching.
+
+---
+
+## ⚡ Core Philosophy & Features
+
+- 🤖 **Agentic-First & Context-Rich:** Built-in introspection commands (`nouclip info`, `nouclip list --json`) that allow AI agents and scripts to discover paths, inspect storage, and reuse existing artifacts.
+- 📦 **Zero-Waste Artifact Management:** Downloaded raw videos, audio WAVs, word-level Whisper transcripts (`.json`), and styled ASS subtitle files are preserved in dedicated folders rather than deleted silently.
+- ⏱️ **Human & Agent Timestamps:** Supports flexible range syntaxes like `--range 13:25-14:50`, `01:13:25`, `85s`, and `13m25s`.
+- 🧩 **Hook-First Timelines & Skip Windows (`--timeline` / `--skip`):** Splice several ranges in the order you list them (`--timeline "1:30-1:35 + 0:00-0:15 + 0:25-0:50"` plays the punchline first) and cut bumpers or dead air out of any selection (`--range 0:00-1:30 --skip 0:06-0:14`). One ffmpeg pass, frame-accurate seeks, a 30 ms anti-click fade at every junction, and the subtitles re-timed to the new clip without transcribing again. `nouclip stitch` exposes the same splice as a standalone primitive.
+- 📐 **Universal Aspect Reframing:** Converts videos to any aspect ratio (`9:16`, `1:1`, `4:5`, `16:9`, or custom `W:H`) with multiple framing modes (`blur`, `center`, `pad`, `stretch`).
+- 🎨 **Typography Presets (`--style`):** Instant subtitle styling presets:
+  - `hormozi`: Bold all-caps (Arial Black, 70px), neon green active-word highlight (`&H0000FF00`), pop zoom scaling (118%), thick outline.
+  - `storyteller`: Clean natural-case (Arial, 54px), soft cyan active-word highlight (`&H0050E3C2`), thin outline.
+  - `cinematic`: Wide tracking (Trebuchet MS, 58px), golden amber highlight (`&H0000A5FF`).
+  - `default`: Classic all-caps (Arial Black, 62px) with yellow highlight.
+
+  Each preset ships its own font size; `--font-size`, `--primary-color` and `--highlight-color` override it only when passed.
+- ✂️ **Silence & Pause Trimming (`--silence-trim`):** Reads Whisper word timestamps to automatically cut silent pauses (`>0.6s`), concatenating speech seamlessly and auto-shifting subtitle timestamps.
+- 🎵 **Smart BGM & Sidechain Ducking (`--bgm`):** Auto-loops background music and dynamically ducks/lowers BGM volume when speech is active (`sidechaincompress` + `amix`).
+- ✍️ **Draft & Staged Workflow (`--draft` / `--no-burn`):** Cuts and prepares transcript/ASS files for human or agent review before burning subtitles into the final video.
+- 💬 **YouTube Captions First (`--captions`):** For a YouTube link, `auto`, `transcript` and `highlight` read the video's own captions (uploaded, or YouTube's per-word speech recognition) before sending any audio to Whisper — no STT endpoint needed, nothing downloaded for a transcript. Automatic translations are never used. `--captions only` never transcribes; `--captions off` always does.
+- 📝 **Timed Transcripts for Summaries:** `nouclip transcript <youtube-link> --lang en` writes `[mm:ss -> mm:ss]` paragraphs an AI agent can summarize with chapters and timestamps.
+- 🎙️ **GPU STT Integration:** Directly integrates with local GPU endpoints like **[Voice Compute](https://github.com/nouverse/voice-compute)** or any OpenAI-compatible Whisper API.
+
+---
+
+## 📁 Workspace & Artifact Structure
+
+NouClip organizes all assets in a structured workspace (defaults to `~/.nouclip` or `./.nouclip`):
+
+```text
+~/.nouclip/
+├── downloads/        # Cached source/YouTube videos (never re-downloaded twice)
+├── transcripts/      # Whisper JSON transcripts (*.whisper.json) and ASS scripts (*.ass)
+├── segments/         # Raw cut segments, trimmed audio/video, and reframed files
+└── output/           # Final rendered videos with burned subtitles & mixed BGM
+```
+
+Run `nouclip info` anytime to inspect current paths, file counts, and storage usage.
+
+---
+
+## 📥 Installation
+
+> 💡 **Don't know how to setup?** You can let your AI agent install and configure everything autonomously! Jump to [Let Your AI Agent Setup & Use the CLI](#-let-your-ai-agent-use-the-cli).
+
+### Method 1: Package Managers (Bun / npm / pnpm) — Recommended
+
+The easiest and fastest way to install and update NouClip globally across all platforms:
+
+```bash
+# Using Bun (Recommended & Fastest)
+bun add -g nouclip
+
+# Using npm
+npm install -g nouclip
+
+# Using pnpm
+pnpm add -g nouclip
+
+# Or run instantly without installing:
+bunx nouclip --help
+# or
+npx nouclip --help
+```
+
+---
+
+### Method 2: Standalone Binaries (Pre-compiled)
+
+If you do not have Bun or Node.js installed, download the pre-compiled standalone binary (zero runtime dependencies required) for your operating system from the **[GitHub Releases](https://github.com/nouverse/nouclip/releases)** page:
+
+| Platform | Architecture | Binary |
+|---|---|---|
+| 🐧 Linux | x86_64 | `nouclip-linux-x64` |
+| 🍎 macOS | Apple Silicon (M1/M2/M3/M4) | `nouclip-darwin-arm64` |
+| 🍏 macOS | Intel (x86_64) | `nouclip-darwin-x64` |
+| 🪟 Windows | x86_64 | `nouclip-windows-x64.exe` |
+
+---
+
+### Method 3: One-Line Install Script (Linux / macOS)
+
+Downloads the latest release binary for your architecture and places it into `/usr/local/bin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nouverse/nouclip/main/install.sh | bash
+```
+
+---
+
+### Method 4: From Source (Development)
+
+```bash
+git clone https://github.com/nouverse/nouclip.git
+cd nouclip
+bun install
+
+# Run via Bun
+bun run src/cli.ts --help
+
+# Or build standalone executable
+bun run build
+./dist/nouclip --help
+```
+
+### Updating
+
+Update the way you installed: `bun add -g nouclip@latest`, `npm install -g nouclip@latest`, `pnpm add -g nouclip@latest`, or re-run the install script (it always fetches the latest release). `nouclip --version` confirms.
+
+---
+
+## 📋 Prerequisites
+
+1. **[FFmpeg](https://ffmpeg.org)** & **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** installed on system PATH:
+   - **macOS:** `brew install ffmpeg yt-dlp`
+   - **Ubuntu/Debian:** `sudo apt install ffmpeg && pip install yt-dlp`
+   - **Windows:** `winget install Gyan.FFmpeg yt-dlp`
+2. *(Optional)* **[Voice Compute](https://github.com/nouverse/voice-compute)** or an OpenAI Whisper API endpoint for generating word-level subtitle timings.
+
+---
+
+## ⚙️ Configuration & Environment Variables
+
+NouClip resolves each variable by precedence, first match wins:
+1. Shell environment variables (always win)
+2. `~/.nouclip/.env` (Global user config)
+3. `./.env` (Current working directory — fills in what the global file left unset)
+
+### Example `.env`
+
+```bash
+# Storage & Workspace Paths (Optional)
+NOUCLIP_WORKSPACE_DIR=~/.nouclip
+NOUCLIP_DOWNLOAD_DIR=~/.nouclip/downloads
+NOUCLIP_TRANSCRIPT_DIR=~/.nouclip/transcripts
+NOUCLIP_OUTPUT_DIR=~/.nouclip/output
+
+# STT Whisper / Audio Endpoint (Local voice-compute or Cloud OpenAI/Groq)
+NOUCLIP_OPENAI_AUDIO_URL=http://localhost:8880
+NOUCLIP_OPENAI_AUDIO_API_KEY=
+NOUCLIP_OPENAI_AUDIO_MODEL=large-v3
+
+# LLM Endpoint (Optional — for automated highlight suggestion)
+NOUCLIP_OPENAI_LLM_URL=https://api.openai.com/v1
+NOUCLIP_OPENAI_LLM_API_KEY=
+NOUCLIP_OPENAI_LLM_MODEL=gpt-4o-mini
+```
+
+---
+
+## 🚀 Usage Guide & Workflows
+
+### 1. Inspecting Storage & Cached Assets (Introspection)
+
+```bash
+# Display storage paths, file counts, and service status
+nouclip info
+
+# JSON output for AI agents
+nouclip info --json
+
+# List cached downloaded videos
+nouclip list downloads
+
+# List generated transcripts
+nouclip list transcripts
+
+# List final rendered outputs
+nouclip list output
+```
+
+---
+
+### 2. End-to-End Automated Pipeline (`nouclip auto`)
+
+Downloads (or reuses cache), cuts segment, reframes to vertical, transcribes with Whisper, and burns kinetic subtitles:
+
+```bash
+# Standard automated short (9:16 blurred background with kinetic subtitles)
+nouclip auto "https://youtu.be/EXAMPLE_ID" --range 13:25-14:10
+
+# Power Creator Setup: Hormozi Typography + Silence Trimming + Background Music
+nouclip auto podcast.mp4 \
+  --range 01:20-02:00 \
+  --style hormozi \
+  --silence-trim \
+  --bgm "lofi_track.mp3" \
+  --bgm-volume 0.10 \
+  -o out/viral_short.mp4
+
+# Clean Framing Only (0 subtitles — for video editors & post-production)
+nouclip auto "https://youtu.be/EXAMPLE_ID" --range 13:25-14:10 --no-subtitles -o clean_short.mp4
+
+# From local file with square 1:1 aspect ratio
+nouclip auto interview.mp4 --range 01:20-02:00 --aspect 1:1 --mode pad -o out/feed.mp4
+```
+
+#### Hook-first timelines and skip windows
+
+Retention is decided in the first seconds, so a short rarely plays in source order. `--timeline`
+lists the ranges to keep **in the order they should play**; `--skip` cuts windows (an intro bumper,
+a sponsor read) out of whatever was selected. Both work on local files and YouTube links — a link
+downloads only the window spanning the segments — and the subtitles follow the new timeline
+without a second transcription pass.
+
+```bash
+# Punchline first (1:30-1:35), then the setup (0:00-0:15), then the explanation (0:25-0:50)
+nouclip auto "https://youtu.be/EXAMPLE_ID" --timeline "1:30-1:35 + 0:00-0:15 + 0:25-0:50"
+
+# Keep 0:00-1:30 but cut the channel bumper at 0:06-0:14 out of it
+nouclip auto podcast.mp4 --range 0:00-1:30 --skip 0:06-0:14
+
+# Several windows, and a manifest written by an agent instead of a flag
+nouclip auto podcast.mp4 --range 0:00-2:00 --skip "0:06-0:14, 1:10-1:20"
+nouclip auto podcast.mp4 --timeline-file tracks.json   # [{ "start": "01:30", "end": "01:35", "tag": "hook" }, ...]
+```
+
+Segments are separated by `+`, `;` or `,`; every one needs an explicit end. A timeline that
+resolves to a single range behaves exactly like `--range`.
+
+---
+
+### 3. Review & Staged Workflow (Draft Mode)
+
+If you want to review and correct subtitle typos before rendering the final video:
+
+```bash
+# Step 1: Generate segment + transcript without burning
+nouclip auto "https://youtu.be/EXAMPLE_ID" --range 13:25-14:10 --style hormozi --draft
+
+# Output:
+# 📹 Video Segment  : ~/.nouclip/segments/video_framed_9x16_blur.mp4
+# 📝 Subtitle Script: ~/.nouclip/transcripts/video_13m25s-14m10s.ass
+
+# Step 2: Open and edit the .ass file in any text editor
+
+# Step 3: Burn the verified subtitles & mix BGM
+nouclip subtitle ~/.nouclip/segments/video_framed_9x16_blur.mp4 \
+  --sub ~/.nouclip/transcripts/video_13m25s-14m10s.ass \
+  --bgm "lofi_track.mp3" \
+  -o ~/.nouclip/output/final_short.mp4
+```
+
+---
+
+### 4. Modular Commands
+
+#### Cut Video Segment
+```bash
+nouclip cut input.mp4 --range 13:25-14:10
+
+# Several ranges in one pass, or a range minus skip windows (always re-encoded, frame-accurate)
+nouclip cut input.mp4 --timeline "1:30-1:35 + 0:00-0:15"
+nouclip cut input.mp4 --range 0:00-2:00 --skip "0:06-0:14, 1:10-1:20"
+```
+
+#### Stitch Segments & Re-time Existing Subtitles
+```bash
+# Splice segments in the order given, and re-time the source's word timestamps onto the result
+nouclip stitch input.mp4 \
+  --timeline "1:30-1:35 + 0:00-0:15" \
+  --subtitles input.whisper.json \
+  -o stitched.mp4 \
+  --output-subtitles stitched.whisper.json
+
+# Then burn them — the re-timed words already know where every cut is
+nouclip subtitle stitched.mp4 --sub stitched.whisper.json --style hormozi -o final.mp4
+```
+
+#### Reframe Aspect Ratio & Mode
+```bash
+# 9:16 Vertical with blurred background fill
+nouclip crop input.mp4 --aspect 9:16 --mode blur
+
+# 1:1 Square with center crop fill
+nouclip crop input.mp4 --aspect 1:1 --mode center
+```
+
+#### Extract Audio & Whisper Transcribe
+```bash
+nouclip extract input.mp4 --lang id --format json
+```
+
+#### Burn Subtitles & Mix Audio
+```bash
+nouclip subtitle input.mp4 --sub captions.ass --bgm music.mp3 --bgm-volume 0.10 -o final.mp4
+```
+
+---
+
+## 🤖 Let Your AI Agent Use the CLI
+
+NouClip is designed from the ground up to be **agentic-first**. AI coding assistants and autonomous agents (such as [Nouride](https://nouride.com), Claude Code, Cursor, Cline, OpenClaw, etc.) can inspect storage, reuse cached artifacts, and execute multi-step clipping pipelines deterministically using structured JSON outputs and the bundled skill.
+
+---
+
+### 💡 Don't know how to setup? Let your AI agent do it for you!
+
+You don't need to manually configure FFmpeg, yt-dlp, or install binaries yourself. Simply give your AI agent the bundled skill file from **[`skills/nouclip/SKILL.md`](./skills/nouclip/SKILL.md)** and ask:
+
+> *"Please setup and verify NouClip on my machine."*
+
+The skill includes self-contained instructions for your agent to automatically check for `nouclip`, `ffmpeg`, and `yt-dlp`, run OS-specific installations, and verify health without manual intervention.
+
+---
+
+### 📦 Bundled Agent Skill
+
+A comprehensive, production-ready skill file is maintained directly inside the repository at **[`skills/nouclip/SKILL.md`](./skills/nouclip/SKILL.md)**.
+
+### 🛠️ Installing the Skill into Your AI Agent
+
+#### 1. For Nouride / OpenClaw Daemons
+Copy the skill folder into your agent's shared or personal skills directory:
+```bash
+# Copy to Nouride shared skills
+cp -r skills/nouclip ~/.nouride/agents/shared/skills/
+# Or copy to a specific agent's workspace
+cp -r skills/nouclip ~/.nouride/agents/<agent-id>/skills/
+```
+
+#### 2. For Cursor / Claude Code / Cline / Windsurf
+Copy the skill instructions into your project's rules or prompt directory:
+```bash
+# Cursor Rules
+mkdir -p .cursor/rules && cp skills/nouclip/SKILL.md .cursor/rules/nouclip.md
+
+# Claude Code / Cline Instructions
+mkdir -p .claude && cp skills/nouclip/SKILL.md .claude/nouclip-skill.md
+```
+
+### 💡 Why Agents Love NouClip:
+- **Introspection:** `nouclip info --json` gives the agent total visibility into disk usage, configured endpoints, and workspace directories.
+- **Discovery:** `nouclip list <downloads|transcripts|segments|output> --json` returns structured arrays of existing assets so agents never re-download or re-transcribe unnecessarily.
+- **Safety & Drafts:** The `--draft` / `--no-burn` flag allows agents to review, correct typos, or adjust ASS subtitle scripts before committing to a full video render.
+
+---
+
+## 🧪 Testing & CI
+
+NouClip comes with an extensive unit and E2E test suite running across macOS, Linux, and Windows:
+
+```bash
+# Run all tests
+bun test
+
+# Typecheck & Lint
+bun run typecheck
+bun run lint
+```
+
+---
+
+## 📄 License
+
+MIT © [Nouverse Technologies](https://nouverse.tech) & [Gading Nasution](https://gading.dev)

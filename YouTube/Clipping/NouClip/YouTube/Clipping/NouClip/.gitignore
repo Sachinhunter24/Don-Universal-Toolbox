@@ -1,0 +1,21 @@
+# Dependencies & build output
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local environment
+.env
+.env.local
+
+# NouClip workspace artifacts
+.nouclip/
+downloads/
+segments/
+output/
+transcripts/
+temp/
+
+# Logs & OS cruft
+*.log
+.DS_Store

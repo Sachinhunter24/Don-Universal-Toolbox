@@ -1,0 +1,83 @@
+name: Release & Distribute Packages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  # Trusted publishing: npm takes this job's OIDC identity instead of a token, so there is no
+  # NPM_TOKEN to expire and no 2FA code a runner cannot type.
+  id-token: write
+
+jobs:
+  build-and-release:
+    name: Build & Distribute NouClip Packages
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout NouClip Code
+        uses: actions/checkout@v4
+
+      - name: Setup Bun Runtime
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Node.js Runtime
+        uses: actions/setup-node@v4
+        with:
+          # 24 ships npm 11; trusted publishing needs npm 11.5.1 or later.
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install Dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run Quality Gates
+        run: |
+          bun run typecheck
+          bun run lint
+          bun test
+
+      - name: Compile Standalone Cross-Platform Binaries & Node Bundle
+        run: |
+          bun run build:all
+
+      - name: Package Debian (.deb)
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          mkdir -p deb-pkg/DEBIAN deb-pkg/usr/local/bin
+          cat << EOF > deb-pkg/DEBIAN/control
+          Package: nouclip
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Nouverse Technologies <admin@nouverse.tech>
+          Description: High-performance AI video clipper & auto-shorts generator
+          Depends: ffmpeg
+          EOF
+          cp dist/nouclip-linux-x64 deb-pkg/usr/local/bin/nouclip
+          chmod 755 deb-pkg/usr/local/bin/nouclip
+          dpkg-deb --build --root-owner-group deb-pkg dist/nouclip_amd64.deb
+
+      # No `|| true`: a publish that fails has to fail the run, or a release looks shipped while npm
+      # still serves the previous version.
+      - name: Publish to NPM
+        run: npm publish --access public
+
+      # Only from a release: a manual run has no release to attach to, and is for publishing to npm.
+      - name: Attach Assets to GitHub Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/nouclip-linux-x64
+            dist/nouclip-darwin-arm64
+            dist/nouclip-darwin-x64
+            dist/nouclip-windows-x64.exe
+            dist/nouclip_amd64.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
