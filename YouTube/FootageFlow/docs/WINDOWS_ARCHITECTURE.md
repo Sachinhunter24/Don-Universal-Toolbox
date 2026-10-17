@@ -1,0 +1,102 @@
+# Windows architecture audit
+
+Status: Windows 11 x64 is supported from FootageFlow v0.2.0. v0.10.0 adds the local Workspace, Saved Searches, Smart Collections, Provider Health states, Command Palette, and Global Search records while retaining the same shared-core boundary. Windows-native installation and runtime checks are performed on a clean Windows GitHub Actions runner before release.
+
+## Current shared code
+
+All 22 search Provider implementations, API/direct-mode selection, pagination continuations, `HTTPClient`, normalized `MediaAsset`, rights mapping, Provider capabilities and errors, smart keyword rules, compound-query intent preservation, clip/output models, clipboard URL parsing, update release parsing/version comparison/Release Notes sanitizing, deduplication, filters, filename suggestions, feedback URLs, source-sidecar generation, path roots, log redaction, and Codable persistence are platform-neutral Swift. v0.8.0 adds the same attribution exporter, rights audit, portable manifest/import validator, duplicate engine, lazy SHA-256 cache, export redaction, and contact-sheet plan; v0.9.0 adds research records, provider parsing, relevance ranking, citation formatting, Research Notes, combined reports, and schema v2 migration; v0.10.0 adds the local Workspace index, Saved Searches, collection rules, Provider Health state, and command routing; v0.11.0 adds five no-key provider entries; v0.12.0 adds shared keyboard routing, safe filter reset, updater semantics, and the ten-language accessibility catalog; v0.12.1 adds required-concept preservation and all-concept Balanced relevance gating. macOS and Windows therefore use one business implementation for media and research providers.
+
+`PersistentStore` owns project, segment, favorite, history, download-record, Saved Search, and Provider Health behavior. The macOS `DataStore` is a small Combine presentation facade over this shared repository. Windows calls the same repository through the local Core Host.
+
+## macOS-only code
+
+SwiftUI views, `SearchViewModel`, AppKit windows and file panels, AVKit preview, Apple Translation, Security.framework Keychain, macOS process presentation, Finder reveal, and URLSession download presentation remain macOS-only. Swift Package Manager excludes those presentation sources when building on Windows; their implementation is otherwise unchanged.
+
+## Reuse estimate
+
+Approximately 80% of core behavior is shared. Provider, pagination, rights, project persistence, filename, attribution, and sidecar behavior are single-source Swift. Presentation, secure storage, external-process lifecycle, preview, dialogs, and operating-system integration are intentionally implemented per platform.
+
+## Windows UI technology
+
+WPF on .NET 10 is used for the Windows 11 x64 interface. WPF provides a native Windows window/control model, XAML data binding, MediaElement preview, accessibility, high-DPI behavior, and self-contained deployment. Normal users do not install .NET, Swift, Python, Node.js, yt-dlp, or FFmpeg separately.
+
+## Shared architecture
+
+```text
+WPF UI and Windows adapters
+        |
+        | JSON over stdin/stdout (secrets never in argv)
+        v
+Swift FootageFlowCore.exe
+        |
+        +-- ProviderFactory and 22 search providers
+        +-- multilingual queries, pagination, models, rights, filters, clip/output metadata, updates, dedupe
+        +-- PersistentStore, feedback URLs and source sidecars
+
+macOS SwiftUI UI
+        |
+        +-- the same Swift core types and providers in-process
+```
+
+The WPF orchestrator launches Provider requests independently. Results can appear as each source completes; cancellation or timeout stops only the affected request. Each successful batch carries its Provider-owned continuation, while a failed next page keeps the already displayed results and previous retry position.
+
+Pexels and Pixabay still use best-effort direct search without a key and only their official APIs with a configured key. National Archives, Europeana, Coverr, and Vimeo similarly select their supported key/no-key mode in `ProviderFactory`. The Windows yt-dlp adapter uses `--ignore-config`, does not import browser cookies, rejects embedded credentials/private network addresses, and maps errors to the same user-facing states as macOS.
+
+Link Downloader uses the existing Windows `DownloadQueueService`, cancellation tokens, progress, retry, project folder, source sidecars, and download history. Full/clip scope and output presets create normal queue assets rather than a second queue. Only yt-dlp/FFmpeg process control and WPF presentation are Windows-specific; media metadata and file-source records use the same shared models.
+
+The Windows WPF shell sends `checkUpdate` to the same Core Host. The Swift core calls GitHub's latest stable Release API, validates the semantic version and repository URL, and converts Release Notes to inert plain text. WPF holds only two non-persistent session flags so it checks once and presents at most one automatic dialog per launch. It does not download or install application packages.
+
+## Windows-only responsibilities
+
+- Windows Credential Manager for API keys.
+- `%LOCALAPPDATA%\FootageFlow` settings/log/database roots and the user's Videos folder for downloads.
+- Windows-invalid and reserved filename protection, long-path manifest support, and conflict-safe filenames.
+- Explorer open/reveal, folder chooser, WPF MediaElement/image preview.
+- Bounded direct-download queue and yt-dlp child-process cancellation.
+- Self-contained .NET publish, Swift runtime DLL collection, bundled pinned yt-dlp and GPL FFmpeg/FFprobe, and Inno Setup installer.
+
+## Migration and release risks
+
+- Swift Foundation behavior and runtime DLL packaging differ on Windows and must be verified on the Windows runner.
+- WPF cannot reuse SwiftUI/AppKit view code; only business behavior is shared.
+- yt-dlp is best-effort and changes upstream. It remains checksum-pinned and never loads browser cookies or user configuration.
+- An unsigned installer can trigger Microsoft Defender SmartScreen. Release notes must describe signing status honestly.
+- Windows path rules, Chinese/space paths, cancellation, clean install, and uninstall require Windows-native acceptance tests.
+- Provider websites can rate-limit or change independently. One source failure never fails the aggregate search.
+
+## v0.7.2 cross-platform query boundary
+
+Windows requests structured `SearchKeyword` records from the Swift Core Host. Language, origin, and priority are optional Codable fields, preserving old history and project data. WPF renders and schedules those records but has no second translation dictionary. Both shells use the same ten canonical compound queries, relevance intent, language ordering, de-duplication, and matched-query metadata.
+
+The Windows scheduler enforces the same 12-request global limit, two requests per official/public Provider, and one per direct/yt-dlp Provider. A rate-limit or temporary-block state halts that Provider's remaining wave without cancelling successful sources. macOS applies the equivalent in-process limits.
+
+## Version plan
+
+- v0.1.0 remains unchanged and macOS-only.
+- v0.2.0 introduced Windows 11 x64 support.
+- v0.5.0 added Search Expansion, Provider pagination, Link Downloader, and Feedback & Community on both supported platforms.
+- v0.6.0 is one creator-workflow release for clip downloads, smart expansion, output presets, local clipboard detection, Openverse, and Dailymotion.
+- v0.7.0 adds cross-platform update notifications, visible official release notes, View Update, Remind Later, and a manual Settings check without automatic installation.
+- v0.7.1 adds Precise, Balanced, and Broad modes backed by the same Swift `SearchRelevanceEngine` used on macOS. The Windows client retains high-recall candidates and sends them to the Core Host for filtering and ranking; no relevance rules are duplicated in C#.
+- v0.7.2 adds shared ten-language compound search, structured query metadata, and language-aware ranking without duplicating the lexicon in C#.
+- v0.7.3 hardens session-only clipboard suggestions, direct-media format fallback, Openverse filtering, link error classification, and real creator-workflow validation.
+- v0.7.4 removes the persisted 24-hour update deferral. Not Now is session-only, so an outdated online installation checks and reminds again after a complete restart without forcing an update.
+- v0.8.0 adds the shared project export/attribution/rights/backup/duplicate/contact-sheet model. v0.9.0 adds the shared research/culture model, Research Notes, citations, exports, and portable schema v2. v0.10.0 adds shared Workspace records; the actor-backed local index only sees FootageFlow metadata and scrubs credential-looking note/script fragments. WPF provides native save/open/reveal/clipboard/PNG-rendering glue only; it does not duplicate the project business rules.
+- v0.11.0 adds Dareful and ESA Multimedia public direct-search adapters plus Mazwai, DVIDS, and British Pathé limited-discovery entries. The five IDs, settings migration, capabilities, rights behavior, and error isolation remain in the shared Swift core; Windows only presents the shared results and official-search actions.
+- Windows 10 x64 is not declared supported because it has not completed the same validation.
+
+## Release validation gate
+
+Before publishing a Windows release, CI must complete all of the following on a clean Windows runner:
+
+- Shared Swift Release build, Core Host health check, and cross-platform tests.
+- Native WPF Release build and Windows platform acceptance checks.
+- Self-contained publish, Swift runtime collection, pinned yt-dlp/FFmpeg checksum verification, and Inno Setup compilation.
+- Clean per-user installation, installed Core Host health check, native WPF startup-liveness check, and clean uninstall.
+- Real public Provider smoke tests; optional key paths run only when repository secrets are configured.
+- Real YouTube analysis or correct hosted-IP access-limit classification, real Dailymotion and public direct-media analysis, plus a validated 10-second editing-compatible MP4 clip and source sidecars.
+- Portable archive, installer, SHA-256 verification, runtime/license inventory, tracked-secret scan, and candidate artifact upload.
+- Cross-platform portable-project fixtures, project-report formats, rights-audit/duplicate decisions, and the shared contact-sheet plan.
+- Workspace Core Host records, Saved Search persistence, ten-language resource validation, WPF workspace/command-palette build, and the same clean-install startup/uninstall gate.
+
+No developer credential, browser cookie, token, password, private-link query value, or user path may be embedded in source, logs, feedback URLs, sidecars, or release packages.

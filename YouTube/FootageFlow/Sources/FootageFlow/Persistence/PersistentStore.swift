@@ -1,0 +1,339 @@
+import Foundation
+
+final class PersistentStore {
+  private(set) var database: PersistentDatabase
+  private let fileURL: URL?
+
+  var projects: [ProjectRecord] { database.projects }
+  var segments: [ScriptSegmentRecord] { database.segments }
+  var favorites: [SavedAssetRecord] { database.favorites }
+  var history: [SearchHistoryRecord] { database.history }
+  var downloads: [DownloadRecord] { database.downloads }
+  var reviewedAssets: [ProjectReviewRecord] { database.reviewedAssets ?? [] }
+  var duplicateDecisions: [DuplicateDecisionRecord] { database.duplicateDecisions ?? [] }
+  var fileHashCache: [FileHashCacheRecord] { database.fileHashCache ?? [] }
+  var researchReferences: [ResearchReferenceRecord] { database.researchReferences ?? [] }
+  var savedSearches: [SavedSearchRecord] { database.savedSearches ?? [] }
+  var providerHealth: [ProviderHealthRecord] { database.providerHealth ?? [] }
+
+  init(inMemory: Bool = false, fileURL: URL? = nil) {
+    if inMemory {
+      self.fileURL = nil
+    } else if let fileURL {
+      self.fileURL = fileURL
+    } else {
+      let directory = PlatformPaths.applicationData
+      try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+      let current = directory.appendingPathComponent("FootageFlow.database.json")
+      #if os(macOS)
+        let legacy = directory.deletingLastPathComponent().appendingPathComponent(
+          "FootageFinder/FootageFinder.database.json")
+        Self.migrateDatabaseIfNeeded(current: current, legacy: legacy)
+      #endif
+      self.fileURL = current
+    }
+    database = Self.load(from: self.fileURL) ?? PersistentDatabase()
+  }
+
+  static func migrateDatabaseIfNeeded(current: URL, legacy: URL) {
+    guard !FileManager.default.fileExists(atPath: current.path) else { return }
+    guard FileManager.default.fileExists(atPath: legacy.path) else { return }
+    try? FileManager.default.copyItem(at: legacy, to: current)
+  }
+
+  @discardableResult func addProject(name: String) -> ProjectRecord {
+    let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    let project = ProjectRecord(name: clean.isEmpty ? tr("project.untitled") : clean)
+    database.projects.append(project)
+    save()
+    return project
+  }
+
+  func deleteProject(id: UUID) {
+    database.projects.removeAll { $0.id == id }
+    database.segments.removeAll { $0.projectID == id }
+    database.favorites = database.favorites.map { item in
+      var value = item
+      if value.projectID == id { value.projectID = nil }
+      return value
+    }
+    database.history = database.history.map { item in
+      var value = item
+      if value.projectID == id { value.projectID = nil }
+      return value
+    }
+    database.downloads = database.downloads.map { item in
+      var value = item
+      if value.projectID == id { value.projectID = nil }
+      return value
+    }
+    database.reviewedAssets?.removeAll { $0.projectID == id }
+    database.duplicateDecisions?.removeAll { $0.projectID == id }
+    database.researchReferences?.removeAll { $0.projectID == id }
+    save()
+  }
+
+  func updateProject(_ project: ProjectRecord) {
+    guard let index = database.projects.firstIndex(where: { $0.id == project.id }) else { return }
+    var updated = project
+    updated.updatedAt = .now
+    database.projects[index] = updated
+    save()
+  }
+
+  func replaceSegments(projectID: UUID?, values: [ScriptSegmentRecord]) {
+    database.segments.removeAll { $0.projectID == projectID }
+    database.segments += values
+    touchProject(projectID)
+    save()
+  }
+
+  func toggleFavorite(asset: MediaAsset, projectID: UUID?, segmentIndex: Int? = nil) {
+    if let index = database.favorites.firstIndex(where: {
+      $0.stableID == asset.stableID && $0.projectID == projectID
+    }) {
+      database.favorites.remove(at: index)
+    } else {
+      database.favorites.append(
+        SavedAssetRecord(asset: asset, projectID: projectID, segmentIndex: segmentIndex))
+    }
+    touchProject(projectID)
+    save()
+  }
+
+  func addFavorite(asset: MediaAsset, projectID: UUID?, segmentIndex: Int? = nil) {
+    guard !isFavorite(asset, projectID: projectID) else { return }
+    database.favorites.append(
+      SavedAssetRecord(asset: asset, projectID: projectID, segmentIndex: segmentIndex))
+    touchProject(projectID)
+    save()
+  }
+
+  func isFavorite(_ asset: MediaAsset, projectID: UUID?) -> Bool {
+    database.favorites.contains { $0.stableID == asset.stableID && $0.projectID == projectID }
+  }
+
+  func addHistory(_ record: SearchHistoryRecord) {
+    database.history.insert(record, at: 0)
+    if database.history.count > 300 {
+      database.history.removeLast(database.history.count - 300)
+    }
+    touchProject(record.projectID)
+    save()
+  }
+
+  func deleteHistory(id: UUID) {
+    database.history.removeAll { $0.id == id }
+    save()
+  }
+
+  func clearHistory() {
+    database.history = []
+    save()
+  }
+
+  func addDownload(_ record: DownloadRecord) {
+    guard !database.downloads.contains(where: { $0.localPath == record.localPath }) else { return }
+    database.downloads.insert(record, at: 0)
+    touchProject(record.projectID)
+    save()
+  }
+
+  func deleteDownloadRecord(id: UUID) {
+    database.downloads.removeAll { $0.id == id }
+    save()
+  }
+
+  func setReviewed(projectID: UUID, stableAssetID: String, reviewed: Bool) {
+    var records = database.reviewedAssets ?? []
+    records.removeAll { $0.projectID == projectID && $0.stableAssetID == stableAssetID }
+    if reviewed {
+      records.append(ProjectReviewRecord(projectID: projectID, stableAssetID: stableAssetID))
+    }
+    database.reviewedAssets = records
+    touchProject(projectID)
+    save()
+  }
+
+  func setDuplicateDecision(projectID: UUID, pairKey: String, decision: DuplicateDecision) {
+    var records = database.duplicateDecisions ?? []
+    records.removeAll { $0.projectID == projectID && $0.pairKey == pairKey }
+    records.append(
+      DuplicateDecisionRecord(projectID: projectID, pairKey: pairKey, decision: decision))
+    database.duplicateDecisions = records
+    touchProject(projectID)
+    save()
+  }
+
+  func resetDuplicateDecisions(projectID: UUID) {
+    database.duplicateDecisions = (database.duplicateDecisions ?? []).filter {
+      $0.projectID != projectID
+    }
+    touchProject(projectID)
+    save()
+  }
+
+  /// Removes only the project association. Downloaded media and the global
+  /// download record are retained, so resolving a duplicate never deletes a
+  /// creator's local file by surprise.
+  func removeAssetFromProject(projectID: UUID, stableAssetID: String) {
+    database.favorites.removeAll { $0.projectID == projectID && $0.stableID == stableAssetID }
+    database.downloads = database.downloads.map { record in
+      var value = record
+      if value.projectID == projectID && value.stableAssetID == stableAssetID {
+        value.projectID = nil
+      }
+      return value
+    }
+    database.reviewedAssets?.removeAll {
+      $0.projectID == projectID && $0.stableAssetID == stableAssetID
+    }
+    touchProject(projectID)
+    save()
+  }
+
+  func updateFileHashCache(_ value: FileHashCacheRecord) {
+    var records = database.fileHashCache ?? []
+    records.removeAll { $0.localPath == value.localPath }
+    records.append(value)
+    database.fileHashCache = records
+    save()
+  }
+
+  func addResearchReference(_ value: ResearchReferenceRecord) -> Bool {
+    var records = database.researchReferences ?? []
+    guard
+      !records.contains(where: { $0.projectID == value.projectID && $0.stableID == value.stableID })
+    else { return false }
+    records.append(value)
+    database.researchReferences = records
+    touchProject(value.projectID)
+    save()
+    return true
+  }
+
+  func updateResearchReference(_ value: ResearchReferenceRecord) {
+    guard let index = (database.researchReferences ?? []).firstIndex(where: { $0.id == value.id })
+    else {
+      return
+    }
+    var updated = value
+    updated.updatedAt = .now
+    database.researchReferences?[index] = updated
+    touchProject(value.projectID)
+    save()
+  }
+
+  func deleteResearchReference(id: UUID) {
+    guard let value = database.researchReferences?.first(where: { $0.id == id }) else { return }
+    database.researchReferences?.removeAll { $0.id == id }
+    touchProject(value.projectID)
+    save()
+  }
+
+  @discardableResult
+  func addSavedSearch(_ value: SavedSearchRecord) -> SavedSearchRecord {
+    var record = value
+    let requested =
+      record.name.isEmpty ? (record.query.isEmpty ? "Saved Search" : record.query) : record.name
+    record.name = uniqueSavedSearchName(requested, excluding: record.id)
+    database.savedSearches = (database.savedSearches ?? []) + [record]
+    save()
+    return record
+  }
+
+  func updateSavedSearch(_ value: SavedSearchRecord) {
+    guard let index = (database.savedSearches ?? []).firstIndex(where: { $0.id == value.id }) else {
+      return
+    }
+    var record = value
+    record.name = uniqueSavedSearchName(record.name, excluding: record.id)
+    record.updatedAt = .now
+    database.savedSearches?[index] = record
+    save()
+  }
+
+  func deleteSavedSearch(id: UUID) {
+    database.savedSearches?.removeAll { $0.id == id }
+    save()
+  }
+
+  @discardableResult
+  func duplicateSavedSearch(id: UUID) -> SavedSearchRecord? {
+    guard let original = (database.savedSearches ?? []).first(where: { $0.id == id }) else {
+      return nil
+    }
+    var duplicate = original
+    duplicate.id = UUID()
+    duplicate.name = uniqueSavedSearchName(original.name, excluding: duplicate.id)
+    duplicate.createdAt = .now
+    duplicate.updatedAt = .now
+    database.savedSearches = (database.savedSearches ?? []) + [duplicate]
+    save()
+    return duplicate
+  }
+
+  func updateProviderHealth(_ value: ProviderHealthRecord) {
+    var records = database.providerHealth ?? []
+    records.removeAll { $0.providerID == value.providerID }
+    records.append(value)
+    database.providerHealth = records
+    save()
+  }
+
+  /// Commits a fully-validated import in one atomic database write. The caller
+  /// must construct the payload before this method is invoked.
+  func importProject(_ payload: ImportedProjectPayload) {
+    database.projects.append(payload.project)
+    database.segments += payload.segments
+    database.favorites += payload.favorites
+    database.history += payload.history
+    database.downloads += payload.downloads
+    database.reviewedAssets = (database.reviewedAssets ?? []) + payload.reviewedAssets
+    database.duplicateDecisions = (database.duplicateDecisions ?? []) + payload.duplicateDecisions
+    database.researchReferences = (database.researchReferences ?? []) + payload.researchReferences
+    save()
+  }
+
+  func forceSave() { save() }
+
+  private func touchProject(_ projectID: UUID?) {
+    guard let projectID,
+      let index = database.projects.firstIndex(where: { $0.id == projectID })
+    else { return }
+    database.projects[index].updatedAt = .now
+  }
+
+  private func uniqueSavedSearchName(_ requested: String, excluding id: UUID?) -> String {
+    let base = requested.trimmingCharacters(in: .whitespacesAndNewlines)
+    let safeBase = base.isEmpty ? "Saved Search" : base
+    let existing = Set(
+      (database.savedSearches ?? [])
+        .filter { $0.id != id }
+        .map {
+          $0.name.localizedCaseInsensitiveCompare(safeBase) == .orderedSame ? safeBase : $0.name
+        })
+    guard existing.contains(safeBase) else { return safeBase }
+    var number = 2
+    while existing.contains("\(safeBase) (\(number))") { number += 1 }
+    return "\(safeBase) (\(number))"
+  }
+
+  private static func load(from fileURL: URL?) -> PersistentDatabase? {
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    guard let fileURL, let data = try? Data(contentsOf: fileURL) else { return nil }
+    return try? decoder.decode(PersistentDatabase.self, from: data)
+  }
+
+  private func save() {
+    guard let fileURL else { return }
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    guard let data = try? encoder.encode(database) else { return }
+    try? FileManager.default.createDirectory(
+      at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? data.write(to: fileURL, options: .atomic)
+  }
+}

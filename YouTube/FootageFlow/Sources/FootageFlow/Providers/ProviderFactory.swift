@@ -1,0 +1,49 @@
+import Foundation
+
+enum ProviderFactory {
+  static func make(
+    _ id: ProviderID, apiKey: String,
+    directLoader: any DirectSearchPageLoading = LiveDirectSearchPageLoader(),
+    ytDLPService: YTDLPService = YTDLPService()
+  ) -> any MediaProvider {
+    let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    switch id {
+    case .pexels:
+      return key.isEmpty ? PexelsDirectProvider(loader: directLoader) : PexelsProvider(apiKey: key)
+    case .pixabay:
+      return key.isEmpty
+        ? PixabayDirectProvider(loader: directLoader) : PixabayProvider(apiKey: key)
+    case .wikimedia: return WikimediaProvider()
+    case .internetArchive: return InternetArchiveProvider()
+    case .youtube:
+      return key.isEmpty
+        ? YouTubeYTDLPProvider(service: ytDLPService) : YouTubeProvider(apiKey: key)
+    case .nasa: return NASAProvider()
+    case .libraryOfCongress: return LibraryOfCongressProvider()
+    case .nationalArchives:
+      return key.isEmpty ? LimitedDiscoveryProvider(id: id) : NationalArchivesProvider(apiKey: key)
+    case .europeana:
+      return key.isEmpty ? LimitedDiscoveryProvider(id: id) : EuropeanaProvider(apiKey: key)
+    case .peertube: return PeerTubeProvider()
+    case .videvo, .videezy, .mixkit: return LimitedDiscoveryProvider(id: id)
+    case .coverr:
+      return key.isEmpty ? LimitedDiscoveryProvider(id: id) : CoverrProvider(apiKey: key)
+    case .vimeo:
+      return key.isEmpty ? LimitedDiscoveryProvider(id: id) : VimeoProvider(accessToken: key)
+    case .openverse: return OpenverseProvider()
+    case .dailymotion: return DailymotionProvider()
+    case .dareful: return DarefulProvider(loader: directLoader)
+    case .esa: return ESAProvider(loader: directLoader)
+    case .mazwai, .dvids, .britishPathe: return LimitedDiscoveryProvider(id: id)
+    case .linkDownloader: return LimitedDiscoveryProvider(id: id)
+    }
+  }
+
+  static func current(_ id: ProviderID) -> any MediaProvider {
+    make(id, apiKey: KeychainService.read(id))
+  }
+
+  static func currentProviders() -> [any MediaProvider] {
+    ProviderID.searchCases.map(current)
+  }
+}
