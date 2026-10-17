@@ -10,3 +10,6 @@
 [submodule "YouTube/Clipping/FFmpeg"]
 	path = YouTube/Clipping/FFmpeg
 	url = https://github.com/FFmpeg/FFmpeg.git
+[submodule "FootageFlow_source"]
+	path = FootageFlow_source
+	url = https://github.com/xcslys99/FootageFlow.git
