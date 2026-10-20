@@ -10,3 +10,7 @@
 [submodule "YouTube/Clipping/FFmpeg"]
 	path = YouTube/Clipping/FFmpeg
 	url = https://github.com/FFmpeg/FFmpeg.git
+
+[submodule "smart and intelligence/Deep Agents"]
+	path = smart and intelligence/Deep Agents
+	url = https://github.com/langchain-ai/deepagents.git
