@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "default_integration_order": [
+      "official_api",
+      "existing_hermes_tool_or_mcp",
+      "stable_cli",
+      "targeted_source_integration"
+    ],
+    "clone_requires_explicit_task": true,
+    "clone_requires_reviewed_candidate": true,
+    "require_license_metadata": true,
+    "require_pinned_ref": true,
+    "never_clone_into_running_source_tree": true,
+    "never_store_secrets_in_registry": true
+  },
+  "tools": [
+    {
+      "name": "openhands",
+      "role": "execution_agent",
+      "repository": "https://github.com/All-Hands-AI/OpenHands.git",
+      "license": "MIT",
+      "integration": "CLI or documented API, depending on deployment",
+      "pinned_ref_required": true,
+      "default_enabled": false,
+      "notes": "Candidate only. After cloning the exact pinned ref, inspect its LICENSE and dependency licenses, maintenance, setup requirements, and resource footprint before installation or use."
+    },
+    {
+      "name": "ffmpeg",
+      "role": "media_processing",
+      "repository": "https://github.com/FFmpeg/FFmpeg.git",
+      "license": "LGPL/GPL depending on build configuration",
+      "integration": "CLI",
+      "pinned_ref_required": true,
+      "default_enabled": false,
+      "notes": "Prefer installed binary if available; inspect exact build configuration and enabled components. Building from source may exceed free storage/compute."
+    }
+  ]
+}
