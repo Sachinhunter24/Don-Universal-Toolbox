@@ -101,3 +101,8 @@ Sirf file likhne, branch banane ya code push karne se nahi. Ready hone ke liye r
 **Don ka instruction → Jarvis task plan → suitable tool/API adapter → execution → independent verification → saved state → simple report.**
 
 Pehla target ek reliable YouTube V1 workflow hai. Final target ek reusable Jarvis hai jo Don ke explicitly assigned alag-alag digital projects ko isi disciplined tareeqe se execute kar sake.
+
+
+### Important: ChatGPT account compatibility
+
+Custom MCP apps/plugins ka option ChatGPT ke har plan ya mobile app par guaranteed nahi hai. OpenAI ki current documentation ke mutabik custom MCP server setup ChatGPT web par available hai, lekin full write/modify support aam taur par Business/Enterprise/Edu workspaces ke liye hai; Pro par availability read/fetch tak limited ho sakti hai. Account policy aur rollout bhi matter karte hain. Isliye pehle supported access verify karna hoga—sirf API banana kaafi nahi. See [OpenAI's current custom MCP connection guide](https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt).
