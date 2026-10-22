@@ -1,0 +1,142 @@
+# -*- coding: binary -*-
+
+require 'rex/arch'
+##
+# This module contains a helper function for generating payloads from a shuffled
+# set of instructions loaded from a special file.
+##
+module Rex
+  module Payloads
+    class Shuffle
+
+      FLOW_INSTRUCTIONS = {}
+      FLOW_INSTRUCTIONS[Rex::Arch::ARCH_X86] = %w{ call jae jb jbe jc jcxz je jecxz jg jge jl jle jmp jna jnae jnb jnbe jnc jne jng jnge jnl jnle jno jnp jns jnz jo jp jpe jpo js jz }.freeze
+      FLOW_INSTRUCTIONS[Rex::Arch::ARCH_X64] = (FLOW_INSTRUCTIONS[Rex::Arch::ARCH_X86] + %w{ jrcxz }).freeze
+      private_constant :FLOW_INSTRUCTIONS
+
+      #
+      # Shuffle instructions from a GraphML data file and return the assembly source. If an architecture is specified
+      # and supported, labels will be added for control flow instructions such as jumps and calls. Labels are necessary
+      # if any post processing is performed on the source (such as for obfuscation).
+      #
+      # @param file_path [String] The file path to load the GraphML data from.
+      # @param name [String] An optional symbol name to apply to the assembly source.
+      # @param random [Random] Optional seeded RNG used for shuffling and label naming. When
+      #   supplied, the resulting assembly source is deterministic for a given seed; when nil,
+      #   the global RNG is used and output is non-deterministic.
+      def self.from_graphml_file(file_path, arch: nil, name: nil, random: nil)
+        graphml = Rex::Parser::GraphML.from_file(file_path)
+        blocks = create_path(graphml.nodes.select { |_id,node| %w[ data instructions-graph block ].include?(node.attributes['type']) }, graphml.graphs[0].edges, random: random)
+        blocks.map! do |block|
+          hash = { node: block }
+
+          if %w[ instructions-graph block ].include?(block.attributes['type'])
+            hash[:instructions] = process_instructions_graph_block(block, random: random)
+          end
+
+          hash
+        end
+
+        label_prefix = random ? Array.new(4) { ('a'.ord + random.rand(26)).chr }.join : Rex::Text.rand_text_alpha_lower(4)
+        labeler = lambda { |address| "loc_#{label_prefix}#{address.to_s(16).rjust(4, '0')}" }
+
+        source_lines = []
+        labeled = []
+        label_refs = []
+        blocks.each do |block|
+          if [ Rex::Arch::ARCH_X86, Rex::Arch::ARCH_X64 ].include? arch
+            source_lines << labeler.call(block[:node].attributes['address']) + ':'
+            labeled << block[:node].attributes['address']
+            case block[:node].attributes['type']
+            when 'data'
+              instructions = data_block_instructions(block[:node])
+            when 'instructions-graph', 'block'
+              # by default use the raw binary instruction to avoid syntax compatibility issues with metasm
+              instructions = block[:instructions].map { |node| 'db ' + node.attributes['instruction.hex'].strip.chars.each_slice(2).map { |hex| '0x' + hex.join }.join(', ') }
+            end
+          else
+            case block[:node].attributes['type']
+            when 'data'
+              instructions = data_block_instructions(block[:node])
+            when 'instructions-graph', 'block'
+              instructions = block[:instructions].map { |node| node.attributes['instruction.source'] }
+            end
+          end
+
+          unless arch.nil?
+            raise ArgumentError, 'Unsupported architecture' if FLOW_INSTRUCTIONS[arch].nil?
+
+            if %w[ instructions-graph block ].include?(block[:node].attributes['type'])
+              # if a supported architecture was specified, use the original source and apply the necessary labels
+              block[:instructions].each_with_index do |node, index|
+                next unless match = /^(?<mnemonic>\S+)\s+(?<address>0x[a-f0-9]+)$/.match(node.attributes['instruction.source'])
+                next unless FLOW_INSTRUCTIONS[arch].include? match[:mnemonic]
+
+                address = Integer(match[:address])
+                instructions[index] = "#{match[:mnemonic]} #{labeler.call(address)}"
+                label_refs << address
+              end
+            end
+          end
+
+          source_lines += instructions
+        end
+
+        unless label_refs.all? { |address| labeled.include? address  }
+          # raise this here so it's closer to the source of the problem :(
+          raise StandardError, 'Missing label reference'
+        end
+
+
+        source_lines = ([name + ':'] + source_lines.map { |source_line| '  ' + source_line}) unless name.nil?
+        source_lines.join("\n") + "\n"
+      end
+
+      class << self
+        private
+
+        #
+        # Render a 'data' node's raw bytes as a `db` directive. This representation is
+        # architecture-agnostic, so it's used regardless of whether +arch+ was specified.
+        #
+        def data_block_instructions(node)
+          [ 'db ' + node.attributes['data.hex'].strip.chars.each_slice(2).map { |hex| '0x' + hex.join }.join(', ') ]
+        end
+
+        #
+        # Process the specified graph element which represents a single basic block in assembly. This graph element
+        # contains nodes representing each of its instructions.
+        #
+        def process_instructions_graph_block(block, random: nil)
+          subgraph = block.subgraph
+          instructions = subgraph.nodes.select { |_id, node| node.attributes['type'] == 'instruction' }
+          create_path(instructions, subgraph.edges, random: random)
+        end
+
+        def create_path(nodes, edges, random: nil)
+          path = []
+
+          # the initial choices are any node without a predecessor (dependency)
+          targets = edges.map(&:target)
+          choices = nodes.values.select { |node| !targets.include? node.id }
+          until choices.empty?
+            selection = random ? choices.sample(random: random) : choices.sample
+            choices.delete(selection)
+            path << selection
+
+            # check each node for which the selection is a dependency
+            successors = selection.target_edges.map { |edge| nodes[edge.target] }
+            successors.each do |successor|
+              next if path.include? successor
+              next if !successor.source_edges.map { |edge| path.include? nodes[edge.source] }.all?
+
+              choices << successor
+            end
+          end
+
+          path
+        end
+      end
+    end
+  end
+end
