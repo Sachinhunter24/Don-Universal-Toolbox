@@ -1,0 +1,388 @@
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from agents import Agent as SDKAgent, FunctionTool, ToolOutputImage
+from agents.mcp.util import MCPUtil
+from agents.run_context import RunContextWrapper
+from agents.tool_context import ToolContext
+from mcp.shared.auth import AuthorizationCodeResult
+from mcp.types import Tool as MCPTool
+
+from agency_swarm.mcp.oauth import (
+    MCPServerOAuth,
+    OAuthRuntimeContext,
+    get_oauth_runtime_context,
+    get_oauth_user_id,
+    set_oauth_runtime_context,
+    set_oauth_user_id,
+)
+from agency_swarm.mcp.oauth_client import MCPServerOAuthClient
+from agency_swarm.tools.tool_factory import ToolFactory
+
+
+class _DummyServer:
+    def __init__(self, name: str = "dummy_server") -> None:
+        self.name = name
+        self.connect_calls = 0
+        self.cleanup_calls = 0
+        self.session = None
+
+    async def connect(self) -> None:
+        self.connect_calls += 1
+        self.session = object()
+
+    async def cleanup(self) -> None:
+        self.cleanup_calls += 1
+        self.session = None
+
+
+@pytest.mark.asyncio
+@patch("agents.mcp.util.MCPUtil.get_function_tools", new_callable=AsyncMock)
+@patch("agency_swarm.tools.mcp_manager.default_mcp_manager")
+async def test_from_mcp_connects_once_and_reuses_connection(mock_manager, mock_get_function_tools: AsyncMock) -> None:
+    server = _DummyServer()
+    original_invoke = AsyncMock(return_value="payload")
+    function_tool = FunctionTool(
+        name="echo",
+        description="test tool",
+        params_json_schema={"type": "object", "properties": {}},
+        on_invoke_tool=original_invoke,
+        strict_json_schema=False,
+    )
+    mock_get_function_tools.return_value = [function_tool]
+
+    mock_manager.register.side_effect = lambda srv, key=None: srv
+
+    def _ensure_driver(srv) -> None:  # noqa: ANN001, ANN202
+        srv.connect_calls += 1
+        srv.session = object()
+
+    mock_manager._ensure_driver.side_effect = _ensure_driver
+    mock_manager.get.return_value = server
+
+    # Test that from_mcp returns FunctionTool instances
+    tools = ToolFactory.from_mcp([server])
+
+    assert len(tools) == 1
+    assert server.connect_calls == 1
+    assert server.cleanup_calls == 0
+
+    # Verify the tool is wrapped with error handling but still delegates to original
+    ctx = RunContextWrapper(context=None)
+    result = await tools[0].on_invoke_tool(ctx, "{}")
+    assert result == "payload"
+    original_invoke.assert_called_once()
+
+
+@pytest.mark.asyncio
+@patch("agents.mcp.util.MCPUtil.get_function_tools", new_callable=AsyncMock)
+@patch("agency_swarm.tools.mcp_manager.default_mcp_manager")
+async def test_from_mcp_tools_are_invokable(mock_manager, mock_get_function_tools: AsyncMock) -> None:
+    """Test that tools converted from MCP servers can be invoked correctly."""
+
+    async def mock_invoke(ctx, input_json: str):
+        return f"Echo: {input_json}"
+
+    function_tool = FunctionTool(
+        name="echo",
+        description="test tool",
+        params_json_schema={"type": "object", "properties": {"message": {"type": "string"}}},
+        on_invoke_tool=mock_invoke,
+        strict_json_schema=False,
+    )
+    mock_get_function_tools.return_value = [function_tool]
+
+    server = _DummyServer()
+    mock_manager.register.return_value = server
+    mock_manager.ensure_connected = AsyncMock()
+    mock_manager.get.return_value = server
+
+    # Test that from_mcp returns FunctionTool instances
+    tools = ToolFactory.from_mcp([server])
+
+    assert len(tools) == 1
+    tool = tools[0]
+
+    # Verify tool properties
+    assert tool.name == "echo"
+    assert tool.description == "test tool"
+    assert "message" in tool.params_json_schema["properties"]
+
+    # Invoke the tool and verify it works
+    ctx = RunContextWrapper(context=None)
+    result = await tool.on_invoke_tool(ctx, '{"message": "hello"}')
+
+    assert result == 'Echo: {"message": "hello"}'
+
+    # Invoke again to verify tool can be called multiple times
+    result2 = await tool.on_invoke_tool(ctx, '{"message": "world"}')
+
+    assert result2 == 'Echo: {"message": "world"}'
+
+
+@pytest.mark.asyncio
+@patch("agents.mcp.util.MCPUtil.get_function_tools", new_callable=AsyncMock)
+@patch("agency_swarm.tools.mcp_manager.default_mcp_manager")
+async def test_from_mcp_function_tools_preserve_structured_outputs(
+    mock_manager, mock_get_function_tools: AsyncMock
+) -> None:
+    """FunctionTool instances from MCP must preserve structured outputs like ToolOutputImage."""
+
+    image_output = ToolOutputImage(image_url="https://example.com/sample.png")
+
+    async def mock_invoke(ctx, input_json: str):
+        return image_output
+
+    function_tool = FunctionTool(
+        name="structured",
+        description="returns structured output",
+        params_json_schema={"type": "object", "properties": {}},
+        on_invoke_tool=mock_invoke,
+        strict_json_schema=False,
+    )
+    mock_get_function_tools.return_value = [function_tool]
+
+    server = _DummyServer()
+    mock_manager.register.return_value = server
+    mock_manager.ensure_connected = AsyncMock()
+    mock_manager.get.return_value = server
+
+    # Get FunctionTool instances from MCP
+    tools = ToolFactory.from_mcp([server])
+    assert len(tools) == 1
+    tool = tools[0]
+
+    # Verify the tool preserves structured outputs
+    ctx = RunContextWrapper(context=None)
+    result = await tool.on_invoke_tool(ctx, "{}")
+
+    assert result is image_output
+
+
+class _FailingCallServer(_DummyServer):
+    """Minimal MCPServer surface for the real SDK tool-conversion pipeline."""
+
+    tool_input_guardrails = None
+    tool_output_guardrails = None
+
+    async def list_tools(self, run_context=None, agent=None):  # noqa: ANN001, ANN201
+        return [MCPTool(name="failing_tool", inputSchema={"type": "object", "properties": {}})]
+
+    async def call_tool(self, tool_name, arguments, meta=None):  # noqa: ANN001, ANN201
+        raise RuntimeError("Connection timed out after 5 seconds")
+
+    def _get_failure_error_function(self, failure_error_function):  # noqa: ANN001, ANN201
+        return failure_error_function
+
+    def _get_needs_approval_for_tool(self, tool, agent):  # noqa: ANN001, ANN202
+        return False
+
+
+@pytest.mark.asyncio
+async def test_from_mcp_tools_catch_exceptions_and_return_error_strings() -> None:
+    """MCP tools must return error strings through the real SDK failure_error_function path."""
+    from agency_swarm.tools.mcp_persistence import PersistentMCPServerManager
+
+    manager = PersistentMCPServerManager()
+    server = _FailingCallServer()
+    try:
+        with patch("agency_swarm.tools.mcp_manager.default_mcp_manager", manager):
+            tools = ToolFactory.from_mcp([server])
+        assert len(tools) == 1
+
+        ctx = ToolContext(
+            context=None,
+            tool_name="failing_tool",
+            tool_call_id="call-1",
+            tool_arguments="{}",
+        )
+        result = await tools[0].on_invoke_tool(ctx, "{}")
+
+        # SDK's default_tool_error_function formats failures as strings for the agent
+        assert isinstance(result, str)
+        assert "error" in result.lower()
+        assert "Connection timed out after 5 seconds" in result
+    finally:
+        await manager.shutdown()
+
+
+async def test_oauth_client_converts_with_real_agents_mcp_util(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OAuth clients must satisfy the Agents SDK MCPServer tool-conversion interface."""
+    server = MCPServerOAuthClient(MCPServerOAuth(url="https://example.com/mcp", name="github"))
+
+    async def list_tools(
+        run_context: RunContextWrapper[object] | None = None,
+        agent: SDKAgent | None = None,
+    ) -> list[MCPTool]:
+        return [MCPTool(name="echo", inputSchema={"type": "object", "properties": {}})]
+
+    monkeypatch.setattr(server, "list_tools", list_tools)
+
+    tools = await MCPUtil.get_function_tools(
+        server,
+        False,
+        RunContextWrapper(context=None),
+        SDKAgent(name="mcp_tool_loader"),
+    )
+
+    assert [tool.name for tool in tools] == ["echo"]
+
+
+@patch("agents.mcp.util.MCPUtil.get_function_tools", new_callable=AsyncMock)
+@patch("agency_swarm.tools.mcp_manager.default_mcp_manager")
+async def test_from_mcp_uses_user_scoped_persistence_keys(mock_manager, mock_get_function_tools: AsyncMock) -> None:
+    function_tool = FunctionTool(
+        name="echo",
+        description="test tool",
+        params_json_schema={"type": "object", "properties": {}},
+        on_invoke_tool=AsyncMock(return_value="ok"),
+        strict_json_schema=False,
+    )
+    mock_get_function_tools.return_value = [function_tool]
+
+    server_config = MCPServerOAuth(url="https://example.com/mcp", name="github")
+    server_a = MCPServerOAuthClient(server_config)
+    server_b = MCPServerOAuthClient(server_config)
+
+    registered_keys: list[str] = []
+
+    def _register(server, key=None):
+        registered_keys.append(key)
+        return server
+
+    mock_manager.register.side_effect = _register
+    mock_manager.get.return_value = None
+    mock_manager.ensure_connected = AsyncMock()
+    mock_manager._ensure_driver.return_value = None
+
+    try:
+        set_oauth_user_id("user-a")
+        ToolFactory.from_mcp([server_a])
+
+        set_oauth_user_id("user-b")
+        ToolFactory.from_mcp([server_b])
+    finally:
+        set_oauth_user_id(None)
+
+    assert len(registered_keys) == 2
+    assert registered_keys[0] != registered_keys[1]
+    assert registered_keys[0].startswith("github::oauth::")
+    assert registered_keys[1].startswith("github::oauth::")
+
+
+@patch("agents.mcp.util.MCPUtil.get_function_tools", new_callable=AsyncMock)
+@patch("agency_swarm.tools.mcp_manager.default_mcp_manager")
+async def test_from_mcp_rebuilds_oauth_client_when_same_server_object_is_reused_across_users(
+    mock_manager, mock_get_function_tools: AsyncMock
+) -> None:
+    function_tool = FunctionTool(
+        name="echo",
+        description="test tool",
+        params_json_schema={"type": "object", "properties": {}},
+        on_invoke_tool=AsyncMock(return_value="ok"),
+        strict_json_schema=False,
+    )
+    mock_get_function_tools.return_value = [function_tool]
+    mock_manager.get.return_value = None
+    mock_manager.ensure_connected = AsyncMock()
+    mock_manager._ensure_driver.return_value = None
+
+    server = MCPServerOAuthClient(MCPServerOAuth(url="https://example.com/mcp", name="github"))
+    registered_servers: list[MCPServerOAuthClient] = []
+    registered_keys: list[str] = []
+
+    def _register(candidate, key=None):
+        registered_servers.append(candidate)
+        registered_keys.append(key)
+        return candidate
+
+    mock_manager.register.side_effect = _register
+
+    try:
+        set_oauth_user_id("user-a")
+        ToolFactory.from_mcp([server])
+
+        set_oauth_user_id("user-b")
+        ToolFactory.from_mcp([server])
+    finally:
+        set_oauth_user_id(None)
+
+    assert len(registered_servers) == 2
+    assert registered_servers[0] is not registered_servers[1]
+    assert registered_keys[0] != registered_keys[1]
+
+
+@patch("agents.mcp.util.MCPUtil.get_function_tools", new_callable=AsyncMock)
+@patch("agency_swarm.tools.mcp_manager.default_mcp_manager")
+async def test_from_mcp_refreshes_static_handlers_when_reusing_oauth_client(
+    mock_manager, mock_get_function_tools: AsyncMock
+) -> None:
+    function_tool = FunctionTool(
+        name="echo",
+        description="test tool",
+        params_json_schema={"type": "object", "properties": {}},
+        on_invoke_tool=AsyncMock(return_value="ok"),
+        strict_json_schema=False,
+    )
+    mock_get_function_tools.return_value = [function_tool]
+    mock_manager._ensure_driver.return_value = None
+
+    oauth_config = MCPServerOAuth(url="https://example.com/mcp", name="github")
+
+    async def first_redirect(_auth_url: str) -> None:
+        return None
+
+    async def first_callback() -> AuthorizationCodeResult:
+        return AuthorizationCodeResult(code="code-1", state=None)
+
+    async def second_redirect(_auth_url: str) -> None:
+        return None
+
+    async def second_callback() -> AuthorizationCodeResult:
+        return AuthorizationCodeResult(code="code-2", state=None)
+
+    persistent = MCPServerOAuthClient(
+        oauth_config,
+        {"redirect": first_redirect, "callback": first_callback},
+    )
+    candidate = MCPServerOAuthClient(
+        oauth_config,
+        {"redirect": second_redirect, "callback": second_callback},
+    )
+    mock_manager.get.return_value = persistent
+
+    ToolFactory.from_mcp([candidate])
+
+    assert persistent._redirect_handler is second_redirect
+    assert persistent._callback_handler is second_callback
+
+
+@patch("agency_swarm.tools.mcp_converter.MCPUtil.get_function_tools", new_callable=AsyncMock)
+@patch("agency_swarm.tools.mcp_manager.default_mcp_manager")
+async def test_from_mcp_preserves_oauth_context_in_discovery_thread(
+    mock_manager, mock_get_function_tools: AsyncMock
+) -> None:
+    seen_context: dict[str, object] = {}
+
+    async def _capture_context(*args, **kwargs):
+        seen_context["user_id"] = get_oauth_user_id()
+        seen_context["runtime"] = get_oauth_runtime_context()
+        return []
+
+    mock_get_function_tools.side_effect = _capture_context
+    mock_manager.get.return_value = None
+    mock_manager.register.side_effect = lambda server, key=None: server
+    mock_manager._ensure_driver.return_value = None
+
+    runtime = OAuthRuntimeContext(mode="saas_stream", user_id="user-a", timeout=600.0)
+    server = MCPServerOAuthClient(MCPServerOAuth(url="https://example.com/mcp", name="github"))
+
+    try:
+        set_oauth_user_id("user-a")
+        set_oauth_runtime_context(runtime)
+        ToolFactory.from_mcp([server])
+    finally:
+        set_oauth_runtime_context(None)
+        set_oauth_user_id(None)
+
+    assert seen_context == {"user_id": "user-a", "runtime": runtime}
