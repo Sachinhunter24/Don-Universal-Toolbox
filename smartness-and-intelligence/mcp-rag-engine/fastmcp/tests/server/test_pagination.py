@@ -1,0 +1,662 @@
+"""Tests for MCP pagination support."""
+
+from __future__ import annotations
+
+from unittest.mock import call, patch
+
+import mcp_types
+import pytest
+from mcp.server.context import ServerRequestContext
+from mcp.shared.exceptions import MCPError
+from mcp.types import INVALID_PARAMS
+
+from fastmcp import Client, FastMCP
+from fastmcp.utilities.pagination import CursorState, paginate_sequence
+
+
+class TestCursorEncoding:
+    """Tests for cursor encoding/decoding."""
+
+    def test_encode_decode_roundtrip(self) -> None:
+        """Cursor should survive encode/decode roundtrip."""
+        state = CursorState(offset=100)
+        encoded = state.encode()
+        decoded = CursorState.decode(encoded)
+        assert decoded.offset == 100
+
+    def test_encode_produces_string(self) -> None:
+        """Encoded cursor should be a string."""
+        state = CursorState(offset=50)
+        encoded = state.encode()
+        assert isinstance(encoded, str)
+        assert len(encoded) > 0
+
+    def test_decode_invalid_base64_raises(self) -> None:
+        """Invalid base64 should raise ValueError."""
+        with pytest.raises(ValueError, match="Invalid cursor"):
+            CursorState.decode("not-valid-base64!!!")
+
+    def test_decode_invalid_json_raises(self) -> None:
+        """Valid base64 but invalid JSON should raise ValueError."""
+        import base64
+
+        invalid = base64.urlsafe_b64encode(b"not json").decode()
+        with pytest.raises(ValueError, match="Invalid cursor"):
+            CursorState.decode(invalid)
+
+    @pytest.mark.parametrize("offset", ["1", 1.5, -1, True, None, [0]])
+    def test_decode_rejects_a_malformed_offset(self, offset: object) -> None:
+        """An offset that is not a whole non-negative count is an invalid cursor.
+
+        A string or a float reached the slice and raised TypeError, which the
+        server reports as an internal error rather than invalid parameters, and a
+        negative one sliced from the end and returned a valid-looking page.
+        """
+        import base64
+        import json
+
+        invalid = base64.urlsafe_b64encode(json.dumps({"o": offset}).encode()).decode()
+        with pytest.raises(ValueError, match="Invalid cursor"):
+            CursorState.decode(invalid)
+
+    def test_decode_missing_offset_raises(self) -> None:
+        """JSON missing the offset key should raise ValueError."""
+        import base64
+        import json
+
+        invalid = base64.urlsafe_b64encode(json.dumps({"x": 1}).encode()).decode()
+        with pytest.raises(ValueError, match="Invalid cursor"):
+            CursorState.decode(invalid)
+
+
+class TestPaginateSequence:
+    """Tests for the paginate_sequence helper."""
+
+    def test_first_page_no_cursor(self) -> None:
+        """First page should start from beginning."""
+        items = list(range(25))
+        page, cursor = paginate_sequence(items, None, 10)
+        assert page == list(range(10))
+        assert cursor is not None
+
+    def test_second_page_with_cursor(self) -> None:
+        """Second page should continue from cursor."""
+        items = list(range(25))
+        _, cursor = paginate_sequence(items, None, 10)
+        page, next_cursor = paginate_sequence(items, cursor, 10)
+        assert page == list(range(10, 20))
+        assert next_cursor is not None
+
+    def test_last_page_returns_none_cursor(self) -> None:
+        """Last page should return None cursor."""
+        items = list(range(25))
+        _, c1 = paginate_sequence(items, None, 10)
+        _, c2 = paginate_sequence(items, c1, 10)
+        page, next_cursor = paginate_sequence(items, c2, 10)
+        assert page == list(range(20, 25))
+        assert next_cursor is None
+
+    def test_empty_list(self) -> None:
+        """Empty list should return empty page and no cursor."""
+        page, cursor = paginate_sequence([], None, 10)
+        assert page == []
+        assert cursor is None
+
+    def test_exact_page_size(self) -> None:
+        """List exactly matching page size should return no cursor."""
+        items = list(range(10))
+        page, cursor = paginate_sequence(items, None, 10)
+        assert page == items
+        assert cursor is None
+
+    def test_smaller_than_page_size(self) -> None:
+        """List smaller than page size should return all items."""
+        items = list(range(5))
+        page, cursor = paginate_sequence(items, None, 10)
+        assert page == items
+        assert cursor is None
+
+    def test_invalid_cursor_raises(self) -> None:
+        """Invalid cursor should raise ValueError."""
+        with pytest.raises(ValueError, match="Invalid cursor"):
+            paginate_sequence([1, 2, 3], "invalid!", 10)
+
+
+class TestMalformedCursorParams:
+    """A tampered cursor is invalid parameters, not an internal error."""
+
+    @staticmethod
+    def _cursor(offset: object) -> str:
+        import base64
+        import json
+
+        return base64.urlsafe_b64encode(json.dumps({"o": offset}).encode()).decode()
+
+    @pytest.mark.parametrize("offset", ["1", 1.5, -1])
+    def test_paginate_sequence_rejects_a_malformed_offset(self, offset: object) -> None:
+        with pytest.raises(ValueError, match="Invalid cursor"):
+            paginate_sequence([0, 1, 2], self._cursor(offset), page_size=2)
+
+    async def test_list_tools_reports_invalid_params(self) -> None:
+        """The caller maps the ValueError to INVALID_PARAMS, so the client sees that."""
+        server = FastMCP(list_page_size=1)
+
+        @server.tool(name="one")
+        def one() -> int:
+            return 1
+
+        @server.tool(name="two")
+        def two() -> int:
+            return 2
+
+        async with Client(server) as client:
+            with pytest.raises(MCPError) as excinfo:
+                await client.list_tools_mcp(cursor=self._cursor(-1))
+
+        assert excinfo.value.error.code == INVALID_PARAMS
+
+
+class TestServerPagination:
+    """Integration tests for server pagination."""
+
+    @pytest.mark.parametrize(
+        "method,first_page,second_page",
+        [
+            (
+                "list_tools",
+                mcp_types.ListToolsResult(
+                    tools=[
+                        mcp_types.Tool(name="first", input_schema={"type": "object"})
+                    ],
+                    next_cursor="",
+                ),
+                mcp_types.ListToolsResult(
+                    tools=[
+                        mcp_types.Tool(name="second", input_schema={"type": "object"})
+                    ],
+                ),
+            ),
+            (
+                "list_resources",
+                mcp_types.ListResourcesResult(
+                    resources=[mcp_types.Resource(name="first", uri="test://first")],
+                    next_cursor="",
+                ),
+                mcp_types.ListResourcesResult(
+                    resources=[mcp_types.Resource(name="second", uri="test://second")],
+                ),
+            ),
+            (
+                "list_resource_templates",
+                mcp_types.ListResourceTemplatesResult(
+                    resource_templates=[
+                        mcp_types.ResourceTemplate(
+                            name="first", uri_template="test://first/{id}"
+                        )
+                    ],
+                    next_cursor="",
+                ),
+                mcp_types.ListResourceTemplatesResult(
+                    resource_templates=[
+                        mcp_types.ResourceTemplate(
+                            name="second", uri_template="test://second/{id}"
+                        )
+                    ],
+                ),
+            ),
+            (
+                "list_prompts",
+                mcp_types.ListPromptsResult(
+                    prompts=[mcp_types.Prompt(name="first")],
+                    next_cursor="",
+                ),
+                mcp_types.ListPromptsResult(prompts=[mcp_types.Prompt(name="second")]),
+            ),
+        ],
+    )
+    async def test_empty_cursor_fetches_the_next_page(
+        self,
+        method: str,
+        first_page: mcp_types.PaginatedResult,
+        second_page: mcp_types.PaginatedResult,
+    ) -> None:
+        async with Client(FastMCP()) as client:
+            with patch.object(
+                client, f"{method}_mcp", side_effect=[first_page, second_page]
+            ) as list_page:
+                items = await getattr(client, method)(max_pages=2)
+
+        assert [item.name for item in items] == ["first", "second"]
+        extra_kwargs = {"cache_mode": "use"} if method == "list_tools" else {}
+        assert list_page.await_args_list == [
+            call(cursor=None, **extra_kwargs),
+            call(cursor="", **extra_kwargs),
+        ]
+
+    async def test_tools_pagination_returns_all_tools(self) -> None:
+        """Client should receive all tools across paginated requests."""
+        server = FastMCP(list_page_size=10)
+
+        for i in range(25):
+
+            @server.tool(name=f"tool_{i}")
+            def make_tool() -> str:
+                return "ok"
+
+        async with Client(server) as client:
+            tools = await client.list_tools()
+            assert len(tools) == 25
+            tool_names = {t.name for t in tools}
+            assert tool_names == {f"tool_{i}" for i in range(25)}
+
+    async def test_tools_follow_empty_cursor_over_mcp_session(self) -> None:
+        class EmptyCursorServer(FastMCP):
+            async def _on_list_tools(
+                self,
+                ctx: ServerRequestContext,
+                params: mcp_types.PaginatedRequestParams | None,
+            ) -> mcp_types.ListToolsResult:
+                cursor = params.cursor if params is not None else None
+                assert cursor in (None, "")
+                return mcp_types.ListToolsResult(
+                    tools=[
+                        mcp_types.Tool(
+                            name="first" if cursor is None else "second",
+                            input_schema={"type": "object"},
+                        )
+                    ],
+                    next_cursor="" if cursor is None else None,
+                )
+
+        async with Client(EmptyCursorServer()) as client:
+            tools = await client.list_tools(max_pages=2)
+
+        assert [tool.name for tool in tools] == ["first", "second"]
+
+    async def test_resources_pagination_returns_all_resources(self) -> None:
+        """Client should receive all resources across paginated requests."""
+        server = FastMCP(list_page_size=10)
+
+        for i in range(25):
+
+            @server.resource(f"test://resource_{i}")
+            def make_resource() -> str:
+                return "data"
+
+        async with Client(server) as client:
+            resources = await client.list_resources()
+            assert len(resources) == 25
+
+    async def test_prompts_pagination_returns_all_prompts(self) -> None:
+        """Client should receive all prompts across paginated requests."""
+        server = FastMCP(list_page_size=10)
+
+        for i in range(25):
+
+            @server.prompt(name=f"prompt_{i}")
+            def make_prompt() -> str:
+                return "text"
+
+        async with Client(server) as client:
+            prompts = await client.list_prompts()
+            assert len(prompts) == 25
+
+    async def test_manual_pagination(self) -> None:
+        """Client can manually paginate using cursor."""
+        server = FastMCP(list_page_size=10)
+
+        for i in range(25):
+
+            @server.tool(name=f"tool_{i}")
+            def make_tool() -> str:
+                return "ok"
+
+        async with Client(server) as client:
+            # First page
+            result = await client.list_tools_mcp()
+            assert len(result.tools) == 10
+            assert result.next_cursor is not None
+
+            # Second page
+            result2 = await client.list_tools_mcp(cursor=result.next_cursor)
+            assert len(result2.tools) == 10
+            assert result2.next_cursor is not None
+
+            # Third (last) page
+            result3 = await client.list_tools_mcp(cursor=result2.next_cursor)
+            assert len(result3.tools) == 5
+            assert result3.next_cursor is None
+
+    async def test_invalid_cursor_returns_error(self) -> None:
+        """Server should return MCP error for invalid cursor."""
+        server = FastMCP(list_page_size=10)
+
+        @server.tool
+        def my_tool() -> str:
+            return "ok"
+
+        async with Client(server) as client:
+            with pytest.raises(MCPError) as exc:
+                await client.list_tools_mcp(cursor="invalid!")
+            assert exc.value.error.code == -32602
+
+    async def test_no_pagination_when_disabled(self) -> None:
+        """Without list_page_size, all items returned at once."""
+        server = FastMCP()  # No pagination
+
+        for i in range(25):
+
+            @server.tool(name=f"tool_{i}")
+            def make_tool() -> str:
+                return "ok"
+
+        async with Client(server) as client:
+            result = await client.list_tools_mcp()
+            assert len(result.tools) == 25
+            assert result.next_cursor is None
+
+    async def test_pagination_exact_page_boundary(self) -> None:
+        """Test pagination at exact page boundaries."""
+        server = FastMCP(list_page_size=10)
+
+        for i in range(20):  # Exactly 2 pages
+
+            @server.tool(name=f"tool_{i}")
+            def make_tool() -> str:
+                return "ok"
+
+        async with Client(server) as client:
+            # First page
+            result = await client.list_tools_mcp()
+            assert len(result.tools) == 10
+            assert result.next_cursor is not None
+
+            # Second (last) page
+            result2 = await client.list_tools_mcp(cursor=result.next_cursor)
+            assert len(result2.tools) == 10
+            assert result2.next_cursor is None
+
+
+class TestPageSizeValidation:
+    """Tests for list_page_size validation."""
+
+    def test_zero_page_size_raises(self) -> None:
+        """Zero page size should raise ValueError."""
+        with pytest.raises(
+            ValueError, match="list_page_size must be a positive integer"
+        ):
+            FastMCP(list_page_size=0)
+
+    def test_negative_page_size_raises(self) -> None:
+        """Negative page size should raise ValueError."""
+        with pytest.raises(
+            ValueError, match="list_page_size must be a positive integer"
+        ):
+            FastMCP(list_page_size=-1)
+
+
+class TestPaginationCycleDetection:
+    """Tests that auto-pagination terminates when the server returns cycling cursors."""
+
+    @pytest.mark.parametrize("next_cursor", ["stuck", ""])
+    async def test_tools_constant_cursor_terminates(self, next_cursor: str) -> None:
+        """list_tools should stop if the server always returns the same cursor."""
+        server = FastMCP()
+
+        @server.tool
+        def my_tool() -> str:
+            return "ok"
+
+        async with Client(server) as client:
+            original = client.list_tools_mcp
+
+            async def returning_constant_cursor(
+                *,
+                cursor: str | None = None,
+                cache_mode: str = "use",
+            ) -> mcp_types.ListToolsResult:
+                result = await original(cursor=cursor)
+                result.next_cursor = next_cursor
+                return result
+
+            with patch.object(
+                client, "list_tools_mcp", side_effect=returning_constant_cursor
+            ):
+                tools = await client.list_tools()
+
+            # Should get tools from first page + one duplicate (the retry before
+            # detecting the cycle), then stop.
+            assert len(tools) == 2
+            assert all(t.name == "my_tool" for t in tools)
+
+    @pytest.mark.parametrize("next_cursor", ["stuck", ""])
+    async def test_prompts_constant_cursor_terminates(self, next_cursor: str) -> None:
+        """list_prompts should stop if the server always returns the same cursor."""
+        server = FastMCP()
+
+        @server.prompt
+        def my_prompt() -> str:
+            return "text"
+
+        async with Client(server) as client:
+            original = client.list_prompts_mcp
+
+            async def returning_constant_cursor(
+                *,
+                cursor: str | None = None,
+                cache_mode: str = "use",
+            ) -> mcp_types.ListPromptsResult:
+                result = await original(cursor=cursor)
+                result.next_cursor = next_cursor
+                return result
+
+            with patch.object(
+                client, "list_prompts_mcp", side_effect=returning_constant_cursor
+            ):
+                prompts = await client.list_prompts()
+
+            assert len(prompts) == 2
+            assert all(p.name == "my_prompt" for p in prompts)
+
+    @pytest.mark.parametrize("next_cursor", ["stuck", ""])
+    async def test_resources_constant_cursor_terminates(self, next_cursor: str) -> None:
+        """list_resources should stop if the server always returns the same cursor."""
+        server = FastMCP()
+
+        @server.resource("test://r")
+        def my_resource() -> str:
+            return "data"
+
+        async with Client(server) as client:
+            original = client.list_resources_mcp
+
+            async def returning_constant_cursor(
+                *,
+                cursor: str | None = None,
+                cache_mode: str = "use",
+            ) -> mcp_types.ListResourcesResult:
+                result = await original(cursor=cursor)
+                result.next_cursor = next_cursor
+                return result
+
+            with patch.object(
+                client, "list_resources_mcp", side_effect=returning_constant_cursor
+            ):
+                resources = await client.list_resources()
+
+            assert len(resources) == 2
+            assert all(r.name == "my_resource" for r in resources)
+
+    @pytest.mark.parametrize("next_cursor", ["stuck", ""])
+    async def test_resource_templates_constant_cursor_terminates(
+        self, next_cursor: str
+    ) -> None:
+        """list_resource_templates should stop if the server always returns the same cursor."""
+        server = FastMCP()
+
+        @server.resource("test://items/{item_id}")
+        def my_template(item_id: str) -> str:
+            return item_id
+
+        async with Client(server) as client:
+            original = client.list_resource_templates_mcp
+
+            async def returning_constant_cursor(
+                *,
+                cursor: str | None = None,
+                cache_mode: str = "use",
+            ) -> mcp_types.ListResourceTemplatesResult:
+                result = await original(cursor=cursor)
+                result.next_cursor = next_cursor
+                return result
+
+            with patch.object(
+                client,
+                "list_resource_templates_mcp",
+                side_effect=returning_constant_cursor,
+            ):
+                templates = await client.list_resource_templates()
+
+            assert len(templates) == 2
+
+    async def test_cycling_cursors_terminates(self) -> None:
+        """list_tools should stop if the server cycles through a set of cursors."""
+        server = FastMCP()
+
+        @server.tool
+        def my_tool() -> str:
+            return "ok"
+
+        async with Client(server) as client:
+            call_count = 0
+            original = client.list_tools_mcp
+
+            async def returning_cycling_cursor(
+                *,
+                cursor: str | None = None,
+                cache_mode: str = "use",
+            ) -> mcp_types.ListToolsResult:
+                nonlocal call_count
+                result = await original(cursor=cursor)
+                # Cycle through A -> B -> C -> A
+                cursors = ["A", "B", "C"]
+                result.next_cursor = cursors[call_count % 3]
+                call_count += 1
+                return result
+
+            with patch.object(
+                client, "list_tools_mcp", side_effect=returning_cycling_cursor
+            ):
+                tools = await client.list_tools()
+
+            # A, B, C seen, then A is a duplicate → 4 calls total
+            assert call_count == 4
+            assert len(tools) == 4
+
+    async def test_tools_raises_on_auto_pagination_limit(self) -> None:
+        """list_tools should raise RuntimeError after exceeding max_pages."""
+        server = FastMCP()
+
+        @server.tool
+        def my_tool() -> str:
+            return "ok"
+
+        async with Client(server) as client:
+            original = client.list_tools_mcp
+            call_count = 0
+
+            async def returning_unique_cursor(
+                *,
+                cursor: str | None = None,
+                cache_mode: str = "use",
+            ) -> mcp_types.ListToolsResult:
+                nonlocal call_count
+                result = await original(cursor=cursor)
+                call_count += 1
+                result.next_cursor = f"cursor-{call_count}"
+                return result
+
+            with (
+                patch.object(
+                    client, "list_tools_mcp", side_effect=returning_unique_cursor
+                ),
+                pytest.raises(RuntimeError, match="auto-pagination limit"),
+            ):
+                await client.list_tools(max_pages=5)
+
+    async def test_resources_raises_on_auto_pagination_limit(self) -> None:
+        """list_resources should raise RuntimeError after exceeding max_pages."""
+        server = FastMCP()
+
+        @server.resource("test://r")
+        def my_resource() -> str:
+            return "data"
+
+        async with Client(server) as client:
+            original = client.list_resources_mcp
+            call_count = 0
+
+            async def returning_unique_cursor(
+                *,
+                cursor: str | None = None,
+                cache_mode: str = "use",
+            ) -> mcp_types.ListResourcesResult:
+                nonlocal call_count
+                result = await original(cursor=cursor)
+                call_count += 1
+                result.next_cursor = f"cursor-{call_count}"
+                return result
+
+            with (
+                patch.object(
+                    client, "list_resources_mcp", side_effect=returning_unique_cursor
+                ),
+                pytest.raises(RuntimeError, match="auto-pagination limit"),
+            ):
+                await client.list_resources(max_pages=5)
+
+    async def test_prompts_raises_on_auto_pagination_limit(self) -> None:
+        """list_prompts should raise RuntimeError after exceeding max_pages."""
+        server = FastMCP()
+
+        @server.prompt
+        def my_prompt() -> str:
+            return "text"
+
+        async with Client(server) as client:
+            original = client.list_prompts_mcp
+            call_count = 0
+
+            async def returning_unique_cursor(
+                *,
+                cursor: str | None = None,
+                cache_mode: str = "use",
+            ) -> mcp_types.ListPromptsResult:
+                nonlocal call_count
+                result = await original(cursor=cursor)
+                call_count += 1
+                result.next_cursor = f"cursor-{call_count}"
+                return result
+
+            with (
+                patch.object(
+                    client, "list_prompts_mcp", side_effect=returning_unique_cursor
+                ),
+                pytest.raises(RuntimeError, match="auto-pagination limit"),
+            ):
+                await client.list_prompts(max_pages=5)
+
+    async def test_normal_pagination_unaffected(self) -> None:
+        """Cycle detection should not interfere with normal pagination."""
+        server = FastMCP(list_page_size=10)
+
+        for i in range(25):
+
+            @server.tool(name=f"tool_{i}")
+            def make_tool() -> str:
+                return "ok"
+
+        async with Client(server) as client:
+            tools = await client.list_tools()
+            assert len(tools) == 25
+            assert len({t.name for t in tools}) == 25

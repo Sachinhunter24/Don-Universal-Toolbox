@@ -1,0 +1,52 @@
+---
+title: "Releases"
+description: "Compatibility decisions, release branches, and documentation publishing"
+icon: truck-fast
+---
+
+FastMCP releases when changes are ready. Release notes describe the user-visible changes and any migration required. Maintainers choose the release scope and version; passing tests alone does not settle a compatibility decision.
+
+## Versioning Policy
+
+Patch releases contain fixes and refinements without breaking supported public behavior. Minor releases add capabilities and may include deliberate breaking changes when their benefit justifies the disruption. Major releases cover larger changes to the framework and its APIs.
+
+### Breaking changes
+
+Evaluate the intended behavior and the users affected before deciding how to ship a change. Compare the cost of migration with the complexity or incorrect behavior that retaining the old contract would preserve. A change described as a bug fix still needs this assessment; a breaking change does not automatically require waiting for the next major version.
+
+Breaking changes in a minor release require a maintainer decision, clear release notes, and migration guidance. Provide deprecation warnings at least one minor release ahead when possible. Do not put a breaking change into a patch release merely because a regression test passes.
+
+The public compatibility contract covers `FastMCP`, `Client`, `Context`, core MCP components and transports, and their public methods and documented behavior. Private implementation details do not have the same guarantee. Experimental APIs may change or disappear; pin versions when relying on them and read the release notes before upgrading.
+
+FastMCP also supports multiple MCP protocol eras. Negotiating an older protocol does not select an older FastMCP implementation; see [protocol version support](/getting-started/upgrading/from-fastmcp-3#protocol-version-support).
+
+### Production upgrades
+
+Use a lockfile or an exact version pin for reproducible deployments. Review the changelog, test your supported workflows, and update the pin deliberately. For example, an exact dependency constraint has this form:
+
+```text
+fastmcp==4.0.10
+```
+
+This illustrates a pin, not a recommendation to remain on that release. Check the [release history](https://github.com/PrefectHQ/fastmcp/releases) for available updates and [SECURITY.md](https://github.com/PrefectHQ/fastmcp/blob/main/SECURITY.md) for security support and private reporting.
+
+## Creating Releases
+
+Only maintainers cut releases. Use the repository's [release skill](https://github.com/PrefectHQ/fastmcp/blob/main/.agents/skills/release/SKILL.md) for the commands and verification steps. It is the maintained procedure; the sequence below explains how the pieces fit together.
+
+1. Review changes since the last stable release on the target line and agree on the version, title, and handwritten notes.
+2. Merge the changelog documentation PR on the release branch before tagging, so the entry is included in the release commit.
+3. Create the GitHub release from that branch. Generate notes starting at the last stable tag, so intervening prereleases do not truncate the changelog.
+4. Verify package publication and, for a current-major stable release, complete documentation publication.
+
+Current-major releases come from `main`. Maintenance releases come from the branch that owns their line, such as `release/3.x` or `release/2.x`. A branch's existence does not by itself promise ongoing security support; consult the security policy.
+
+Publishing a release triggers the package workflows. On the current line, `fastmcp-slim` publishes first, followed by the dependent `fastmcp-tasks`, `fastmcp-remote`, and `fastmcp` distributions. Verify the relevant workflows and package versions on PyPI rather than treating the GitHub release alone as completion. Published versions are immutable; a correction needs a new release.
+
+## Publishing documentation
+
+The live site serves the `published-docs` branch, not `main`. A stable release from `main` opens a PR that copies the release tree to `published-docs` after package publishing succeeds. A maintainer merges that PR, then verifies the `Deploy docs` workflow completed successfully.
+
+Prereleases do not open that publication PR automatically. Docs-only changes between releases can be published through a PR that synchronizes `main` to `published-docs`; follow the release skill's manual publication procedure. Do not push directly to the publication branch.
+
+Maintenance releases update their own changelog and packages without repointing the current documentation site. The `docs/v2/` and `docs/v3/` trees preserve historical documentation; outside their release changelogs, they are frozen snapshots.

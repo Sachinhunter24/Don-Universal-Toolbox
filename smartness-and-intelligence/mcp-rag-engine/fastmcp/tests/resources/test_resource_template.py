@@ -1,0 +1,1793 @@
+import asyncio
+import functools
+import threading
+from typing import Annotated
+from urllib.parse import quote
+
+import pytest
+from mcp.types import TextResourceContents
+from pydantic import BaseModel, Field
+
+from fastmcp import Client, Context, FastMCP
+from fastmcp.resources import ResourceContent, ResourceTemplate
+from fastmcp.resources.function_resource import FunctionResource
+from fastmcp.resources.template import (
+    build_regex,
+    expand_uri_template,
+    match_uri_template,
+)
+from fastmcp.resources.types import BinaryResource, TextResource
+from fastmcp.server import create_proxy
+
+
+class TestResourceTemplate:
+    """Test ResourceTemplate functionality."""
+
+    def test_template_creation(self):
+        """Test creating a template from a function."""
+
+        def my_func(key: str, value: int) -> dict:
+            return {"key": key, "value": value}
+
+        template = ResourceTemplate.from_function(
+            fn=my_func,
+            uri_template="test://{key}/{value}",
+            name="test",
+        )
+        assert template.uri_template == "test://{key}/{value}"
+        assert template.name == "test"
+        assert template.mime_type == "text/plain"  # default
+
+        assert template.fn(key="test", value=42) == my_func(key="test", value=42)
+
+    def test_template_matches(self):
+        """Test matching URIs against a template."""
+
+        def my_func(key: str, value: int) -> dict:
+            return {"key": key, "value": value}
+
+        template = ResourceTemplate.from_function(
+            fn=my_func,
+            uri_template="test://{key}/{value}",
+            name="test",
+        )
+
+        # Valid match
+        params = template.matches("test://foo/123")
+        assert params == {"key": "foo", "value": "123"}
+
+        # No match
+        assert template.matches("test://foo") is None
+        assert template.matches("other://foo/123") is None
+
+    def test_template_matches_with_prefix(self):
+        """Test matching URIs against a template with a prefix."""
+
+        def my_func(key: str, value: int) -> dict:
+            return {"key": key, "value": value}
+
+        template = ResourceTemplate.from_function(
+            fn=my_func,
+            uri_template="app+test://{key}/{value}",
+            name="test",
+        )
+
+        # Valid match
+        params = template.matches("app+test://foo/123")
+        assert params == {"key": "foo", "value": "123"}
+
+        # No match
+        assert template.matches("test://foo/123") is None
+        assert template.matches("test://foo") is None
+        assert template.matches("other://foo/123") is None
+
+    def test_template_uri_validation(self):
+        """Test validation rule: URI template must have at least one parameter."""
+
+        def my_func() -> dict:
+            return {"data": "value"}
+
+        with pytest.raises(
+            ValueError, match="URI template must contain at least one parameter"
+        ):
+            ResourceTemplate.from_function(
+                fn=my_func,
+                uri_template="test://no-params",
+                name="test",
+            )
+
+    def test_template_uri_params_subset_of_function_params(self):
+        """Test validation rule: URI parameters must be a subset of function parameters."""
+
+        def my_func(key: str, value: int) -> dict:
+            return {"key": key, "value": value}
+
+        # This should work - URI params are a subset of function params
+        template = ResourceTemplate.from_function(
+            fn=my_func,
+            uri_template="test://{key}/{value}",
+            name="test",
+        )
+        assert template.uri_template == "test://{key}/{value}"
+
+        # This should fail - 'unknown' is not a function parameter
+        with pytest.raises(
+            ValueError,
+            match="Required function arguments .* must be a subset of the URI path parameters",
+        ):
+            ResourceTemplate.from_function(
+                fn=my_func,
+                uri_template="test://{key}/{unknown}",
+                name="test",
+            )
+
+    def test_required_params_subset_of_uri_params(self):
+        """Test validation rule: Required function parameters must be in URI parameters."""
+
+        # Function with required parameters
+        def func_with_required(
+            required_param: str, optional_param: str = "default"
+        ) -> dict:
+            return {"required": required_param, "optional": optional_param}
+
+        # This should work - required param is in URI
+        template = ResourceTemplate.from_function(
+            fn=func_with_required,
+            uri_template="test://{required_param}",
+            name="test",
+        )
+        assert template.uri_template == "test://{required_param}"
+
+        # This should fail - required param is not in URI
+        with pytest.raises(
+            ValueError,
+            match="Required function arguments .* must be a subset of the URI path parameters",
+        ):
+            ResourceTemplate.from_function(
+                fn=func_with_required,
+                uri_template="test://{optional_param}",
+                name="test",
+            )
+
+    def test_multiple_required_params(self):
+        """Test validation with multiple required parameters."""
+
+        def multi_required(param1: str, param2: int, optional: str = "default") -> dict:
+            return {"p1": param1, "p2": param2, "opt": optional}
+
+        # This works - all required params in URI
+        template = ResourceTemplate.from_function(
+            fn=multi_required,
+            uri_template="test://{param1}/{param2}",
+            name="test",
+        )
+        assert template.uri_template == "test://{param1}/{param2}"
+
+        # This fails - missing one required param
+        with pytest.raises(
+            ValueError,
+            match="Required function arguments .* must be a subset of the URI path parameters",
+        ):
+            ResourceTemplate.from_function(
+                fn=multi_required,
+                uri_template="test://{param1}",
+                name="test",
+            )
+
+    async def test_create_resource(self):
+        """Test creating a resource from a template."""
+
+        def my_func(key: str, value: int) -> str:
+            return f"key={key}, value={value}"
+
+        template = ResourceTemplate.from_function(
+            fn=my_func,
+            uri_template="test://{key}/{value}",
+            name="test",
+        )
+
+        resource = await template.create_resource(
+            "test://foo/123",
+            {"key": "foo", "value": 123},
+        )
+
+        assert isinstance(resource, FunctionResource)
+        # read() returns raw value from function
+        result = await resource.read()
+        assert result == "key=foo, value=123"
+
+        # _read() wraps in ResourceResult
+        resource_result = await resource._read()
+        assert len(resource_result.contents) == 1
+        assert resource_result.contents[0].content == "key=foo, value=123"
+
+    async def test_async_text_resource(self):
+        """Test creating a text resource from async function."""
+
+        async def greet(name: str) -> str:
+            return f"Hello, {name}!"
+
+        template = ResourceTemplate.from_function(
+            fn=greet,
+            uri_template="greet://{name}",
+            name="greeter",
+        )
+
+        resource = await template.create_resource(
+            "greet://world",
+            {"name": "world"},
+        )
+
+        assert isinstance(resource, FunctionResource)
+        # read() returns raw value
+        result = await resource.read()
+        assert result == "Hello, world!"
+
+    async def test_async_binary_resource(self):
+        """Test creating a binary resource from async function."""
+
+        async def get_bytes(value: str) -> bytes:
+            return value.encode()
+
+        template = ResourceTemplate.from_function(
+            fn=get_bytes,
+            uri_template="bytes://{value}",
+            name="bytes",
+        )
+
+        resource = await template.create_resource(
+            "bytes://test",
+            {"value": "test"},
+        )
+
+        assert isinstance(resource, FunctionResource)
+        # read() returns raw bytes
+        result = await resource.read()
+        assert result == b"test"
+
+    async def test_sync_template_runs_concurrently(self):
+        """Sync template functions run in the threadpool and don't block each other."""
+        num_calls = 3
+        barrier = threading.Barrier(num_calls, timeout=0.5)
+
+        def concurrent_template(id: str) -> str:
+            barrier.wait()
+            return id
+
+        template = ResourceTemplate.from_function(
+            fn=concurrent_template, uri_template="data://{id}"
+        )
+
+        # Raises BrokenBarrierError if the reads run one at a time on the loop
+        results = await asyncio.gather(
+            *(template.read(arguments={"id": str(i)}) for i in range(num_calls))
+        )
+        assert results == [str(i) for i in range(num_calls)]
+
+    async def test_basemodel_conversion(self):
+        """Test handling of BaseModel types."""
+
+        class MyModel(BaseModel):
+            key: str
+            value: int
+
+        def get_data(key: str, value: int) -> MyModel:
+            return MyModel(key=key, value=value)
+
+        template = ResourceTemplate.from_function(
+            fn=get_data,
+            uri_template="test://{key}/{value}",
+            name="test",
+        )
+
+        resource = await template.create_resource(
+            "test://foo/123",
+            {"key": "foo", "value": 123},
+        )
+
+        assert isinstance(resource, FunctionResource)
+        # read() returns raw BaseModel
+        result = await resource.read()
+        assert isinstance(result, MyModel)
+        data = result.model_dump()
+        assert data == {"key": "foo", "value": 123}
+
+    async def test_custom_type_conversion(self):
+        """Test handling of custom types."""
+
+        class CustomData:
+            def __init__(self, value: str):
+                self.value = value
+
+            def __str__(self) -> str:
+                return self.value
+
+        def get_data(value: str) -> CustomData:
+            return CustomData(value)
+
+        template = ResourceTemplate.from_function(
+            fn=get_data,
+            uri_template="test://{value}",
+            name="test",
+        )
+
+        resource = await template.create_resource(
+            "test://hello",
+            {"value": "hello"},
+        )
+
+        assert isinstance(resource, FunctionResource)
+        # read() returns raw CustomData object
+        result = await resource.read()
+        assert isinstance(result, CustomData)
+        assert str(result) == "hello"
+
+    async def test_wildcard_param_can_create_resource(self):
+        """Test that wildcard parameters are valid."""
+
+        def identity(path: str) -> str:
+            return path
+
+        template = ResourceTemplate.from_function(
+            fn=identity,
+            uri_template="test://{path*}.py",
+            name="test",
+        )
+
+        assert await template.create_resource(
+            "test://path/to/test.py",
+            {"path": "path/to/test.py"},
+        )
+
+    async def test_wildcard_param_matches(self):
+        def identify(path: str) -> str:
+            return path
+
+        template = ResourceTemplate.from_function(
+            fn=identify,
+            uri_template="test://src/{path*}.py",
+            name="test",
+        )
+        # Valid match
+        params = template.matches("test://src/path/to/test.py")
+        assert params == {"path": "path/to/test"}
+
+    async def test_multiple_wildcard_params(self):
+        """Test that multiple wildcard parameters are valid."""
+
+        def identity(path: str, path2: str) -> str:
+            return f"{path}/{path2}"
+
+        template = ResourceTemplate.from_function(
+            fn=identity,
+            uri_template="test://{path*}/xyz/{path2*}",
+            name="test",
+        )
+
+        params = template.matches("test://path/to/xyz/abc")
+        assert params == {"path": "path/to", "path2": "abc"}
+
+    async def test_wildcard_param_with_regular_param(self):
+        """Test that a wildcard parameter can be used with a regular parameter."""
+
+        def identity(prefix: str, path: str) -> str:
+            return f"{prefix}/{path}"
+
+        template = ResourceTemplate.from_function(
+            fn=identity,
+            uri_template="test://{prefix}/{path*}",
+            name="test",
+        )
+
+        params = template.matches("test://src/path/to/test.py")
+        assert params == {"prefix": "src", "path": "path/to/test.py"}
+
+    async def test_function_with_varargs_not_allowed(self):
+        def func(x: int, *args: int) -> int:
+            return x + sum(args)
+
+        with pytest.raises(
+            ValueError,
+            match=r"Functions with \*args are not supported as resource templates",
+        ):
+            ResourceTemplate.from_function(
+                fn=func,
+                uri_template="test://{x}/{args*}",
+                name="test",
+            )
+
+    async def test_function_with_positional_only_not_allowed(self):
+        def func(x: int, /) -> int:
+            return x
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "Functions with positional-only parameters are not supported as "
+                "resource templates.*standard parameters"
+            ),
+        ):
+            ResourceTemplate.from_function(
+                fn=func,
+                uri_template="test://{x}",
+                name="test",
+            )
+
+    async def test_function_with_keyword_only_ok(self):
+        def func(x: int, *, y: int = 1) -> int:
+            return x + y
+
+        template = ResourceTemplate.from_function(
+            fn=func,
+            uri_template="test://{x}{?y}",
+            name="test",
+        )
+
+        assert await template.read({"x": "2", "y": "3"}) == 5
+
+    async def test_function_with_varkwargs_ok(self):
+        def func(x: int, **kwargs: int) -> int:
+            return x + sum(kwargs.values())
+
+        template = ResourceTemplate.from_function(
+            fn=func,
+            uri_template="test://{x}/{y}/{z}",
+            name="test",
+        )
+        assert template.uri_template == "test://{x}/{y}/{z}"
+
+    async def test_callable_object_as_template(self):
+        """Test that a callable object can be used as a template."""
+
+        class MyTemplate:
+            """This is my template"""
+
+            def __call__(self, x: str) -> str:
+                """ignore this"""
+                return f"X was {x}"
+
+        template = ResourceTemplate.from_function(
+            fn=MyTemplate(),
+            uri_template="test://{x}",
+            name="test",
+        )
+
+        resource = await template.create_resource(
+            "test://foo",
+            {"x": "foo"},
+        )
+
+        assert isinstance(resource, FunctionResource)
+        # read() returns raw string from __call__
+        result = await resource.read()
+        assert result == "X was foo"
+
+
+class TestMatchUriTemplate:
+    """Test match_uri_template function."""
+
+    @pytest.mark.parametrize(
+        "uri, expected_params",
+        [
+            ("test://a/b", None),
+            ("test://a/b/c", None),
+            ("test://a/x/b", {"x": "x"}),
+            ("test://a/x/y/b", None),
+            ("test://a/1-2/b", {"x": "1-2"}),
+        ],
+    )
+    def test_match_uri_template_single_param(
+        self, uri: str, expected_params: dict[str, str]
+    ):
+        """Test that match_uri_template uses the slash delimiter."""
+        uri_template = "test://a/{x}/b"
+        result = match_uri_template(uri=uri, uri_template=uri_template)
+        assert result == expected_params
+
+    @pytest.mark.parametrize(
+        "uri, expected_params",
+        [
+            ("test://foo/123", {"x": "foo", "y": "123"}),
+            ("test://bar/456", {"x": "bar", "y": "456"}),
+            ("test://foo/bar", {"x": "foo", "y": "bar"}),
+            ("test://foo/bar/baz", None),
+            ("test://foo/email@domain.com", {"x": "foo", "y": "email@domain.com"}),
+            ("test://two words/foo", {"x": "two words", "y": "foo"}),
+            ("test://two.words/foo+bar", {"x": "two.words", "y": "foo+bar"}),
+            (
+                f"test://escaped{quote('/', safe='')}word/bar",
+                {"x": "escaped/word", "y": "bar"},
+            ),
+            (
+                f"test://escaped{quote('{', safe='')}x{quote('}', safe='')}word/bar",
+                {"x": "escaped{x}word", "y": "bar"},
+            ),
+            ("prefix+test://foo/123", None),
+            ("test://foo", None),
+            ("other://foo/123", None),
+            ("t.est://foo/bar", None),
+        ],
+    )
+    def test_match_uri_template_simple_params(
+        self, uri: str, expected_params: dict[str, str] | None
+    ):
+        """Test matching URIs against a template with simple parameters."""
+        uri_template = "test://{x}/{y}"
+        result = match_uri_template(uri=uri, uri_template=uri_template)
+        assert result == expected_params
+
+    @pytest.mark.parametrize(
+        "uri, expected_params",
+        [
+            ("test://a/b/foo/c/d/123", {"x": "foo", "y": "123"}),
+            ("test://a/b/bar/c/d/456", {"x": "bar", "y": "456"}),
+            ("prefix+test://a/b/foo/c/d/123", None),
+            ("test://a/b/foo", None),
+            ("other://a/b/foo/c/d/123", None),
+        ],
+    )
+    def test_match_uri_template_params_and_literal_segments(
+        self, uri: str, expected_params: dict[str, str] | None
+    ):
+        """Test matching URIs against a template with parameters and literal segments."""
+        uri_template = "test://a/b/{x}/c/d/{y}"
+        result = match_uri_template(uri=uri, uri_template=uri_template)
+        assert result == expected_params
+
+    @pytest.mark.parametrize(
+        "uri, expected_params",
+        [
+            ("prefix+test://foo/test/123", {"x": "foo", "y": "123"}),
+            ("prefix+test://bar/test/456", {"x": "bar", "y": "456"}),
+            ("test://foo/test/123", None),
+            ("other.prefix+test://foo/test/123", None),
+            ("other+prefix+test://foo/test/123", None),
+        ],
+    )
+    def test_match_uri_template_with_prefix(
+        self, uri: str, expected_params: dict[str, str] | None
+    ):
+        """Test matching URIs against a template with a prefix."""
+        uri_template = "prefix+test://{x}/test/{y}"
+        result = match_uri_template(uri=uri, uri_template=uri_template)
+        assert result == expected_params
+
+    def test_match_uri_template_quoted_params(self):
+        uri_template = "user://{name}/{email}"
+        quoted_name = quote("John Doe", safe="")
+        quoted_email = quote("john@example.com", safe="")
+        uri = f"user://{quoted_name}/{quoted_email}"
+        result = match_uri_template(uri=uri, uri_template=uri_template)
+        assert result == {"name": "John Doe", "email": "john@example.com"}
+
+    @pytest.mark.parametrize(
+        "uri, expected_params",
+        [
+            ("test://a/b", None),
+            ("test://a/b/c", None),
+            ("test://a/x/b", {"x": "x"}),
+            ("test://a/x/y/b", {"x": "x/y"}),
+            ("bad-prefix://a/x/y/b", None),
+            ("test://a/x/y/z", None),
+        ],
+    )
+    def test_match_uri_template_wildcard_param(
+        self, uri: str, expected_params: dict[str, str]
+    ):
+        """Test that match_uri_template uses the slash delimiter."""
+        uri_template = "test://a/{x*}/b"
+        result = match_uri_template(uri=uri, uri_template=uri_template)
+        assert result == expected_params
+
+    @pytest.mark.parametrize(
+        "uri, expected_params",
+        [
+            ("test://a/x/y/b/c/d", {"x": "x/y", "y": "c/d"}),
+            ("bad-prefix://a/x/y/b/c/d", None),
+            ("test://a/x/y/c/d", None),
+            ("test://a/x/b/y", {"x": "x", "y": "y"}),
+        ],
+    )
+    def test_match_uri_template_multiple_wildcard_params(
+        self, uri: str, expected_params: dict[str, str]
+    ):
+        """Test that match_uri_template uses the slash delimiter."""
+        uri_template = "test://a/{x*}/b/{y*}"
+        result = match_uri_template(uri=uri, uri_template=uri_template)
+        assert result == expected_params
+
+    def test_match_uri_template_wildcard_and_literal_param(self):
+        """Test that match_uri_template uses the slash delimiter."""
+        uri = "test://a/x/y/b"
+        uri_template = "test://a/{x*}/{y}"
+        result = match_uri_template(uri=uri, uri_template=uri_template)
+        assert result == {"x": "x/y", "y": "b"}
+
+    def test_match_consecutive_params(self):
+        """Test that consecutive parameters without a / are not matched."""
+        uri = "test://a/x/y"
+        uri_template = "test://a/{x}{y}"
+        result = match_uri_template(uri=uri, uri_template=uri_template)
+        assert result is None
+
+    @pytest.mark.parametrize(
+        "uri, expected_params",
+        [
+            ("file://abc/xyz.py", {"path": "xyz"}),
+            ("file://abc/x/y/z.py", {"path": "x/y/z"}),
+            ("file://abc/x/y/z/.py", {"path": "x/y/z/"}),
+            ("file://abc/x/y/z.md", None),
+            ("file://x/y/z.txt", None),
+        ],
+    )
+    def test_match_uri_template_with_non_slash_suffix(
+        self, uri: str, expected_params: dict[str, str]
+    ):
+        uri_template = "file://abc/{path*}.py"
+        result = match_uri_template(uri=uri, uri_template=uri_template)
+        assert result == expected_params
+
+    @pytest.mark.parametrize(
+        "uri, expected_params",
+        [
+            ("resource://test_foo", {"x": "foo"}),
+            ("resource://test_bar", {"x": "bar"}),
+            ("resource://test_hello", {"x": "hello"}),
+            ("resource://test_with_underscores", {"x": "with_underscores"}),
+            ("resource://test_", None),  # Empty parameter not matched
+            ("resource://test", None),  # Missing parameter delimiter
+            ("resource://other_foo", None),  # Wrong prefix
+            ("other://test_foo", None),  # Wrong scheme
+        ],
+    )
+    def test_match_uri_template_embedded_param(
+        self, uri: str, expected_params: dict[str, str] | None
+    ):
+        """Test matching URIs where parameter is embedded within a word segment."""
+        uri_template = "resource://test_{x}"
+        result = match_uri_template(uri=uri, uri_template=uri_template)
+        assert result == expected_params
+
+    @pytest.mark.parametrize(
+        "uri, expected_params",
+        [
+            ("resource://prefix_foo_suffix", {"x": "foo"}),
+            ("resource://prefix_bar_suffix", {"x": "bar"}),
+            ("resource://prefix_hello_world_suffix", {"x": "hello_world"}),
+            ("resource://prefix__suffix", None),  # Empty parameter not matched
+            ("resource://prefix_suffix", None),  # Missing parameter delimiter
+            ("resource://other_foo_suffix", None),  # Wrong prefix
+            ("resource://prefix_foo_other", None),  # Wrong suffix
+        ],
+    )
+    def test_match_uri_template_embedded_param_with_prefix_and_suffix(
+        self, uri: str, expected_params: dict[str, str] | None
+    ):
+        """Test matching URIs where parameter has both prefix and suffix."""
+        uri_template = "resource://prefix_{x}_suffix"
+        result = match_uri_template(uri=uri, uri_template=uri_template)
+        assert result == expected_params
+
+
+class TestContextHandling:
+    """Test context handling in resource templates."""
+
+    def test_context_parameter_detection(self):
+        """Test that context parameters are properly detected in
+        ResourceTemplate.from_function()."""
+
+        def template_with_context(x: int, ctx: Context) -> str:
+            return str(x)
+
+        ResourceTemplate.from_function(
+            fn=template_with_context,
+            uri_template="test://{x}",
+            name="test",
+        )
+
+        def template_without_context(x: int) -> str:
+            return str(x)
+
+        ResourceTemplate.from_function(
+            fn=template_without_context,
+            uri_template="test://{x}",
+            name="test",
+        )
+
+    def test_parameterized_context_parameter_detection(self):
+        """Test that parameterized context parameters are properly detected in
+        ResourceTemplate.from_function()."""
+
+        def template_with_context(x: int, ctx: Context) -> str:
+            return str(x)
+
+        ResourceTemplate.from_function(
+            fn=template_with_context,
+            uri_template="test://{x}",
+            name="test",
+        )
+
+    def test_parameterized_union_context_parameter_detection(self):
+        """Test that context parameters in a union are properly detected in
+        ResourceTemplate.from_function()."""
+
+        def template_with_context(x: int, ctx: Context | None) -> str:
+            return str(x)
+
+        ResourceTemplate.from_function(
+            fn=template_with_context,
+            uri_template="test://{x}",
+            name="test",
+        )
+
+    async def test_context_injection(self):
+        """Test that context is properly injected during resource creation."""
+
+        def resource_with_context(x: int, ctx: Context) -> str:
+            assert isinstance(ctx, Context)
+            return str(x)
+
+        template = ResourceTemplate.from_function(
+            fn=resource_with_context,
+            uri_template="test://{x}",
+            name="test",
+        )
+
+        from fastmcp import FastMCP
+
+        mcp = FastMCP()
+        context = Context(fastmcp=mcp)
+
+        async with context:
+            resource = await template.create_resource(
+                "test://42",
+                {"x": 42},
+            )
+
+            assert isinstance(resource, FunctionResource)
+            # read() returns the raw value
+            result = await resource.read()
+            assert result == "42"
+
+    async def test_context_optional(self):
+        """Test that context is optional when creating resources."""
+
+        def resource_with_context(x: int, ctx: Context | None = None) -> str:
+            return str(x)
+
+        template = ResourceTemplate.from_function(
+            fn=resource_with_context,
+            uri_template="test://{x}",
+            name="test",
+        )
+
+        # Even for optional context, we need to provide a context
+        mcp = FastMCP()
+        context = Context(fastmcp=mcp)
+
+        async with context:
+            resource = await template.create_resource(
+                "test://42",
+                {"x": 42},
+            )
+
+            assert isinstance(resource, FunctionResource)
+            # read() returns the raw value
+            result = await resource.read()
+            assert result == "42"
+
+    async def test_context_with_functools_wraps_decorator(self):
+        """Regression test for #2524: decorated templates with Context should work."""
+
+        def custom_decorator(func):
+            @functools.wraps(func)
+            async def wrapper(*args, **kwargs):
+                return await func(*args, **kwargs)
+
+            return wrapper
+
+        @custom_decorator
+        async def decorated_template(ctx: Context, item_id: int) -> str:
+            assert isinstance(ctx, Context)
+            return f"item: {item_id}"
+
+        template = ResourceTemplate.from_function(
+            fn=decorated_template,
+            uri_template="test://{item_id}",
+            name="test",
+        )
+
+        mcp = FastMCP()
+        context = Context(fastmcp=mcp)
+
+        async with context:
+            resource = await template.create_resource("test://42", {"item_id": 42})
+            # read() returns the raw value
+            result = await resource.read()
+            assert result == "item: 42"
+
+
+class TestMalformedURITemplates:
+    """Test that malformed URI templates from remote servers don't crash."""
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "test://{1leading}/path",
+            "test://{123}/path",
+        ],
+        ids=[
+            "leading_digit",
+            "all_digits",
+        ],
+    )
+    def test_build_regex_returns_none_for_invalid_group_names(self, template: str):
+        assert build_regex(template) is None
+
+    def test_build_regex_normalizes_hyphens(self):
+        """Hyphens in param names produce valid regex with underscored groups."""
+        regex = build_regex("test://{user-id}/path")
+        assert regex is not None
+        match = regex.match("test://alice/path")
+        assert match is not None
+        assert match.group("user_id") == "alice"
+
+    def test_template_keeps_its_own_pattern(self, monkeypatch):
+        """Reads walk every template, so each keeps its compiled pattern for as
+        long as it lives, independent of any shared cache."""
+        from fastmcp.resources import template as template_module
+
+        def weather(city: str) -> str:
+            return city
+
+        template = ResourceTemplate.from_function(
+            weather, uri_template="own-pattern://forecast/{city}"
+        )
+        assert template.matches("own-pattern://forecast/oslo") == {"city": "oslo"}
+
+        builds = 0
+        literal_pattern = template_module._literal_pattern
+
+        def counting(text: str) -> str:
+            nonlocal builds
+            builds += 1
+            return literal_pattern(text)
+
+        monkeypatch.setattr(template_module, "_literal_pattern", counting)
+        template_module.build_regex.cache_clear()
+        for _ in range(10):
+            assert template.matches("own-pattern://forecast/bergen") == {
+                "city": "bergen"
+            }
+        assert builds == 0
+
+    def test_template_pattern_follows_a_changed_uri_template(self):
+        def weather(city: str) -> str:
+            return city
+
+        template = ResourceTemplate.from_function(
+            weather, uri_template="before://{city}"
+        )
+        assert template.matches("before://oslo") == {"city": "oslo"}
+        renamed = template.model_copy(update={"uri_template": "after://{city}"})
+        assert renamed.matches("before://oslo") is None
+        assert renamed.matches("after://oslo") == {"city": "oslo"}
+
+    def test_mounted_template_wrapper_shares_the_source_pattern(self, monkeypatch):
+        """A mount wraps every template on every list, so a wrapper must not
+        compile the pattern again."""
+        from fastmcp.resources import template as template_module
+        from fastmcp.server.providers.fastmcp_provider import (
+            FastMCPProviderResourceTemplate,
+        )
+
+        def weather(city: str) -> str:
+            return city
+
+        source = ResourceTemplate.from_function(
+            weather, uri_template="mounted://forecast/{city}"
+        )
+        source.matches("mounted://forecast/oslo")
+
+        builds = 0
+        literal_pattern = template_module._literal_pattern
+
+        def counting(text: str) -> str:
+            nonlocal builds
+            builds += 1
+            return literal_pattern(text)
+
+        monkeypatch.setattr(template_module, "_literal_pattern", counting)
+        template_module.build_regex.cache_clear()
+        for _ in range(3):
+            wrapped = FastMCPProviderResourceTemplate.wrap(None, source)
+            assert wrapped.matches("mounted://forecast/bergen") == {"city": "bergen"}
+        assert builds == 0
+
+    def test_copy_can_override_list_query_params(self):
+        def search(tags: list[str] | None = None) -> str:
+            return ",".join(tags or [])
+
+        template = ResourceTemplate.from_function(
+            search, uri_template="items://all{?tags}"
+        )
+        assert template.matches("items://all?tags=a,b") == {"tags": ["a", "b"]}
+        scalar = template.model_copy(update={"_list_query_params": frozenset()})
+        assert scalar.matches("items://all?tags=a,b") == {"tags": "a,b"}
+
+    def test_shared_pattern_cache_is_bounded(self):
+        """Template strings can come from a proxied server, so the shared cache
+        must not grow with every template a remote ever sends."""
+        from fastmcp.resources import template as template_module
+
+        for i in range(5000):
+            match_uri_template("remote://none", f"remote-{i}://{{x}}")
+        assert template_module.build_regex.cache_info().currsize <= 4096
+
+    def test_matching_reuses_the_compiled_template_pattern(self, monkeypatch):
+        """Reads try every template in turn, so a template's pattern is built
+        once, not on every match attempt."""
+        from fastmcp.resources import template as template_module
+
+        builds = 0
+        literal_pattern = template_module._literal_pattern
+
+        def counting(text: str) -> str:
+            nonlocal builds
+            builds += 1
+            return literal_pattern(text)
+
+        monkeypatch.setattr(template_module, "_literal_pattern", counting)
+        uri_template = "cache-probe://reports/café/{year}"
+        assert match_uri_template("cache-probe://other/2024", uri_template) is None
+        first_build = builds
+        assert first_build > 0
+        for _ in range(50):
+            assert match_uri_template("cache-probe://other/2024", uri_template) is None
+        assert match_uri_template(
+            "cache-probe://reports/caf%C3%A9/2024", uri_template
+        ) == {"year": "2024"}
+        assert builds == first_build
+
+    def test_build_regex_returns_none_for_duplicate_group_names(self):
+        assert build_regex("test://{a}/{a}/path") is None
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "test://{a}/{a}/path",
+            "test://{1leading}/path",
+        ],
+        ids=[
+            "duplicate_groups",
+            "leading_digit",
+        ],
+    )
+    def test_match_uri_template_returns_none_for_malformed_templates(
+        self, template: str
+    ):
+        assert match_uri_template("test://anything/path", template) is None
+
+    def test_match_uri_template_normalizes_hyphens(self):
+        """Hyphenated params match and return underscored keys."""
+        result = match_uri_template("test://alice/path", "test://{user-id}/path")
+        assert result == {"user_id": "alice"}
+
+    def test_resource_template_matches_with_hyphenated_params(self):
+        template = ResourceTemplate(
+            uri_template="test://{user-id}/path",
+            name="test",
+            parameters={},
+        )
+        result = template.matches("test://alice/path")
+        assert result == {"user_id": "alice"}
+
+    async def test_hyphenated_template_end_to_end(self):
+        """Register and read a resource with hyphenated URI param names."""
+        from fastmcp import FastMCP
+
+        mcp = FastMCP("test")
+
+        @mcp.resource("data://{user-id}/profile")
+        def get_profile(user_id: str) -> str:
+            return f"profile for {user_id}"
+
+        templates = await mcp.list_resource_templates()
+        assert len(templates) == 1
+        assert templates[0].uri_template == "data://{user-id}/profile"
+
+        result = await mcp.read_resource("data://alice/profile")
+        assert "profile for alice" in str(result)
+
+    def test_build_regex_normalizes_wildcard_hyphens(self):
+        """Wildcard params with hyphens also get underscored groups."""
+        regex = build_regex("files://{file-path*}")
+        assert regex is not None
+        match = regex.match("files://a/b/c")
+        assert match is not None
+        assert match.group("file_path") == "a/b/c"
+
+    def test_expand_uri_template_with_hyphens(self):
+        """expand_uri_template maps underscored params to hyphenated placeholders."""
+        result = expand_uri_template("data://{user-id}/profile", {"user_id": "alice"})
+        assert result == "data://alice/profile"
+
+    def test_query_param_does_not_clobber_path_param(self):
+        """If path and query have the same normalized name, path wins."""
+        result = match_uri_template(
+            "test://alice?user-id=bob", "test://{user-id}{?user-id}"
+        )
+        # path param should be 'alice', not clobbered by query 'bob'
+        assert result is not None
+        assert result["user_id"] == "alice"
+
+    def test_query_param_with_blank_value_is_preserved(self):
+        """Regression for #4056: blank query values (e.g. ?format=) should
+        not be silently dropped. parse_qs without keep_blank_values=True
+        elides empty values, which loses caller intent."""
+        result = match_uri_template(
+            "resource://data/42?format=", "resource://data/{id}{?format}"
+        )
+        assert result is not None
+        assert result == {"id": "42", "format": ""}
+
+    def test_fragment_does_not_prevent_match(self):
+        result = match_uri_template(
+            "test://items/42#section",
+            "test://items/{id}",
+        )
+        assert result == {"id": "42"}
+
+    def test_query_fragment_is_not_part_of_param(self):
+        result = match_uri_template(
+            "test://items?filter=active#section",
+            "test://items{?filter}",
+        )
+        assert result == {"filter": "active"}
+
+    def test_fragment_after_path_param_and_query(self):
+        result = match_uri_template(
+            "test://items/42?format=json#section",
+            "test://items/{id}{?format}",
+        )
+        assert result == {"id": "42", "format": "json"}
+
+    def test_literal_fragment_in_template_still_matches(self):
+        result = match_uri_template(
+            "test://items/42#details",
+            "test://items/{id}#details",
+        )
+        assert result == {"id": "42"}
+
+    def test_literal_fragment_in_template_rejects_other_fragment(self):
+        result = match_uri_template(
+            "test://items/42#other",
+            "test://items/{id}#details",
+        )
+        assert result is None
+
+    def test_encoded_hash_stays_in_path_param(self):
+        result = match_uri_template(
+            "test://items/a%23b",
+            "test://items/{id}",
+        )
+        assert result == {"id": "a#b"}
+
+    def test_query_param_with_blank_and_present_values(self):
+        """Mix of blank and non-blank query values are both surfaced."""
+        result = match_uri_template(
+            "resource://data/42?format=&verbose=true",
+            "resource://data/{id}{?format,verbose}",
+        )
+        assert result is not None
+        assert result == {"id": "42", "format": "", "verbose": "true"}
+
+    def test_exploded_query_param_collects_repeated_values(self):
+        """Regression for #4378: `{?tags*}` collects every repetition."""
+        result = match_uri_template(
+            "items://books?tags=alpha&tags=beta", "items://{category}{?tags*}"
+        )
+        assert result == {"category": "books", "tags": ["alpha", "beta"]}
+
+    def test_exploded_query_param_with_single_value_is_a_list(self):
+        """A single value still arrives as a list, so the type is stable."""
+        result = match_uri_template(
+            "items://books?tags=alpha", "items://{category}{?tags*}"
+        )
+        assert result == {"category": "books", "tags": ["alpha"]}
+
+    def test_non_exploded_query_param_stays_scalar(self):
+        """Without the explode modifier the param is a scalar — first value wins."""
+        result = match_uri_template(
+            "items://books?tag=alpha&tag=beta", "items://{category}{?tag}"
+        )
+        assert result == {"category": "books", "tag": "alpha"}
+
+    async def test_exploded_query_param_reaches_the_function(self):
+        """End-to-end: repeated values arrive as a list[str] argument."""
+
+        def search(category: str, tags: list[str] | None = None) -> dict:
+            return {"category": category, "tags": tags}
+
+        template = ResourceTemplate.from_function(
+            fn=search, uri_template="items://{category}{?tags*}"
+        )
+
+        assert await template.read({"category": "books", "tags": ["a", "b"]}) == {
+            "category": "books",
+            "tags": ["a", "b"],
+        }
+
+    async def test_list_query_param_without_explode_is_comma_separated(self):
+        """RFC 6570 3.2.8: `{?tags}` on a list is `?tags=a,b`, one comma-joined value.
+
+        4.0.5 registered this shape, so rejecting it breaks servers at startup.
+        """
+
+        def search(category: str, tags: list[str] | None = None) -> dict:
+            return {"category": category, "tags": tags}
+
+        template = ResourceTemplate.from_function(
+            fn=search, uri_template="items://{category}{?tags}"
+        )
+
+        params = template.matches("items://books?tags=a,b")
+        assert params == {"category": "books", "tags": ["a", "b"]}
+        assert await template.read(params) == {"category": "books", "tags": ["a", "b"]}
+
+    @pytest.fixture
+    def postponed_search(self):
+        """A function whose annotations are strings, as under PEP 563.
+
+        Defined by exec so the future import applies to it and not to this
+        whole test module.
+        """
+        namespace: dict[str, object] = {}
+        exec(
+            "from __future__ import annotations\n"
+            "def search(category: str, tags: list[str] | None = None) -> dict:\n"
+            "    return {'category': category, 'tags': tags}\n",
+            namespace,
+        )
+        return namespace["search"]
+
+    def test_postponed_annotations_still_split_commas(self, postponed_search):
+        """Under `from __future__ import annotations` the raw signature gives the
+        string `"list[str] | None"`, so hints must be resolved to see the list."""
+        template = ResourceTemplate.from_function(
+            fn=postponed_search, uri_template="items://{category}{?tags}"
+        )
+        assert template.matches("items://books?tags=a,b") == {
+            "category": "books",
+            "tags": ["a", "b"],
+        }
+
+    async def test_postponed_annotations_accept_explode(self, postponed_search):
+        """The explode form registers and collects one or many values."""
+        template = ResourceTemplate.from_function(
+            fn=postponed_search, uri_template="items://{category}{?tags*}"
+        )
+
+        one = match_uri_template("items://books?tags=a", "items://{category}{?tags*}")
+        assert one is not None
+        assert one == {"category": "books", "tags": ["a"]}
+        assert await template.read(one) == {"category": "books", "tags": ["a"]}
+
+        many = match_uri_template(
+            "items://books?tags=a&tags=b", "items://{category}{?tags*}"
+        )
+        assert many is not None
+        assert many == {"category": "books", "tags": ["a", "b"]}
+        assert await template.read(many) == {"category": "books", "tags": ["a", "b"]}
+
+    def test_annotated_list_query_param_splits_commas(self):
+        """`Annotated[...]` must be unwrapped before the list check."""
+
+        def search(
+            category: str,
+            tags: Annotated[list[str] | None, Field(description="tags")] = None,
+        ) -> dict:
+            return {"category": category, "tags": tags}
+
+        template = ResourceTemplate.from_function(
+            fn=search, uri_template="items://{category}{?tags}"
+        )
+        assert template.matches("items://books?tags=a,b") == {
+            "category": "books",
+            "tags": ["a", "b"],
+        }
+
+    async def test_union_with_scalar_query_param_does_not_require_explode(self):
+        """A scalar union branch preserves the existing plain-query contract."""
+
+        def search(
+            category: str, tags: str | list[str] | None = None
+        ) -> dict[str, object]:
+            return {"category": category, "tags": tags}
+
+        template = ResourceTemplate.from_function(
+            fn=search, uri_template="items://{category}{?tags}"
+        )
+        params = match_uri_template(
+            "items://books?tags=alpha&tags=beta",
+            "items://{category}{?tags}",
+        )
+
+        assert params == {"category": "books", "tags": "alpha"}
+        assert await template.read(params) == {
+            "category": "books",
+            "tags": "alpha",
+        }
+
+    async def test_union_with_list_query_param_accepts_explode(self):
+        """A mixed union can opt into repeated values with explode."""
+
+        def search(
+            category: str, tags: str | list[str] | None = None
+        ) -> dict[str, object]:
+            return {"category": category, "tags": tags}
+
+        template = ResourceTemplate.from_function(
+            fn=search, uri_template="items://{category}{?tags*}"
+        )
+        params = match_uri_template(
+            "items://books?tags=alpha&tags=beta",
+            "items://{category}{?tags*}",
+        )
+
+        assert params == {"category": "books", "tags": ["alpha", "beta"]}
+        assert await template.read(params) == {
+            "category": "books",
+            "tags": ["alpha", "beta"],
+        }
+
+    def test_scalar_query_param_rejects_explode(self):
+        """Explode always produces a list, so a scalar-only parameter is invalid."""
+
+        def search(category: str, tag: str = "") -> dict[str, str]:
+            return {"category": category, "tag": tag}
+
+        with pytest.raises(ValueError, match="must accept a list"):
+            ResourceTemplate.from_function(
+                fn=search, uri_template="items://{category}{?tag*}"
+            )
+
+    def test_non_list_collection_query_params_are_unrestricted(self):
+        """Only `list` round-trips through expansion, so only `list` is checked."""
+
+        def search(category: str, tags: set[str] | None = None) -> dict:
+            return {"category": category, "tags": tags}
+
+        ResourceTemplate.from_function(
+            fn=search, uri_template="items://{category}{?tags}"
+        )
+
+    def test_from_function_rejects_hyphen_underscore_collision(self):
+        """Two raw param names that normalize to the same key are rejected."""
+
+        def handler(user_id: str) -> str:
+            return user_id
+
+        with pytest.raises(ValueError, match="both normalize to 'user_id'"):
+            ResourceTemplate.from_function(
+                fn=handler,
+                uri_template="test://{user-id}/{user_id}",
+                name="collision",
+            )
+
+    def test_build_regex_still_works_for_valid_templates(self):
+        regex = build_regex("test://{name}/{id}")
+        assert regex is not None
+        match = regex.match("test://foo/123")
+        assert match is not None
+        assert match.group("name") == "foo"
+        assert match.group("id") == "123"
+
+
+class TestExpandUriTemplate:
+    """Test expand_uri_template — the inverse of match_uri_template."""
+
+    @pytest.mark.parametrize(
+        "template, params, expected",
+        [
+            ("test://{x}", {"x": "foo"}, "test://foo"),
+            ("test://{x}/{y}", {"x": "foo", "y": "bar"}, "test://foo/bar"),
+            ("test://a/{x}/b", {"x": "mid"}, "test://a/mid/b"),
+        ],
+    )
+    def test_expand_simple_params(
+        self, template: str, params: dict[str, str], expected: str
+    ):
+        assert expand_uri_template(template, params) == expected
+
+    @pytest.mark.parametrize(
+        "template, params, expected",
+        [
+            ("test://{path*}", {"path": "a/b/c"}, "test://a/b/c"),
+            ("test://{path*}", {"path": "single"}, "test://single"),
+            ("test://pre/{rest*}", {"rest": "x/y"}, "test://pre/x/y"),
+            (
+                "test://{a*}/mid/{b*}",
+                {"a": "x/y", "b": "p/q"},
+                "test://x/y/mid/p/q",
+            ),
+            ("test://{x}/{path*}", {"x": "foo", "path": "a/b"}, "test://foo/a/b"),
+        ],
+    )
+    def test_expand_wildcard_params(
+        self, template: str, params: dict[str, str], expected: str
+    ):
+        assert expand_uri_template(template, params) == expected
+
+    def test_expand_query_params(self):
+        result = expand_uri_template(
+            "test://data{?format,verbose}",
+            {"format": "json", "verbose": "true"},
+        )
+        assert result in (
+            "test://data?format=json&verbose=true",
+            "test://data?verbose=true&format=json",
+        )
+
+    def test_expand_query_params_partial(self):
+        result = expand_uri_template(
+            "test://data{?format,verbose}",
+            {"format": "json"},
+        )
+        assert result == "test://data?format=json"
+
+    def test_expand_query_params_none(self):
+        result = expand_uri_template("test://data{?format,verbose}", {})
+        assert result == "test://data"
+
+    def test_expand_ignores_extra_params(self):
+        result = expand_uri_template("test://{x}", {"x": "foo", "unused": "bar"})
+        assert result == "test://foo"
+
+    @pytest.mark.parametrize(
+        "template, params, expected",
+        [
+            # Simple {var} matches a single segment, so "/" must be encoded.
+            (
+                "data://{path}/info",
+                {"path": "hello/world"},
+                "data://hello%2Fworld/info",
+            ),
+            ("test://{x}", {"x": "a b"}, "test://a%20b"),
+            ("test://{x}", {"x": "a?b"}, "test://a%3Fb"),
+            ("test://{x}", {"x": "a#b"}, "test://a%23b"),
+            # Wildcard {var*} may span segments, so "/" is preserved but other
+            # reserved characters are still encoded.
+            ("test://{path*}", {"path": "a/b/c"}, "test://a/b/c"),
+            ("test://{path*}", {"path": "a b/c"}, "test://a%20b/c"),
+        ],
+    )
+    def test_expand_encodes_reserved_characters(
+        self, template: str, params: dict[str, str], expected: str
+    ):
+        """Path values are percent-encoded so the result round-trips through match."""
+        assert expand_uri_template(template, params) == expected
+
+
+class TestMatchExpandRoundTrip:
+    """match_uri_template and expand_uri_template must agree on the template grammar."""
+
+    @pytest.mark.parametrize(
+        "template, uri",
+        [
+            ("test://{x}", "test://foo"),
+            ("test://{x}/{y}", "test://foo/bar"),
+            ("test://a/{x}/b", "test://a/mid/b"),
+            ("test://{path*}", "test://a/b/c"),
+            ("test://{path*}", "test://single"),
+            ("test://pre/{rest*}", "test://pre/x/y/z"),
+            ("test://{x}/{path*}", "test://foo/a/b/c"),
+            ("test://{x}{?tags*}", "test://foo?tags=a"),
+            ("test://{x}{?tags*}", "test://foo?tags=a&tags=b"),
+        ],
+    )
+    def test_expand_then_match_is_identity(self, template: str, uri: str):
+        """Extracting params from a URI and expanding them back reproduces the URI."""
+        params = match_uri_template(uri, template)
+        assert params is not None
+        assert expand_uri_template(template, params) == uri
+
+    def test_plain_query_param_does_not_repeat_a_sequence_value(self):
+        """The template decides repeatability, not the runtime value's type.
+
+        A list handed to a plain `{?tags}` must stay one value: expanding it as
+        a repeated key produced a URI that matched back to only its first
+        element, contradicting the scalar contract `{?tags}` documents.
+        """
+        uri = expand_uri_template("test://x{?tags}", {"tags": ["a", "b"]})
+        assert uri == "test://x?tags=a,b"
+
+        params = match_uri_template(uri, "test://x{?tags}", list_params={"tags"})
+        assert params == {"tags": ["a", "b"]}
+        assert expand_uri_template("test://x{?tags}", params) == uri
+
+    def test_query_values_encode_reserved_characters(self):
+        """RFC 6570 query expansion permits only unreserved value characters."""
+        template = "test://x{?tags*}"
+        params = {"tags": ["", "a b", "a+b", "a&b", "a/b", "café"]}
+
+        uri = expand_uri_template(template, params)
+
+        assert uri == (
+            "test://x?tags=&tags=a%20b&tags=a%2Bb&tags=a%26b&tags=a%2Fb&tags=caf%C3%A9"
+        )
+        assert match_uri_template(uri, template) == params
+        assert expand_uri_template("test://x{?q}", {"q": "a/b"}) == "test://x?q=a%2Fb"
+
+    @pytest.mark.parametrize(
+        "template, params",
+        [
+            ("data://{path}/info", {"path": "hello/world"}),
+            ("test://{x}", {"x": "a b c"}),
+            ("test://{x}", {"x": "100%"}),
+            ("test://{x}/{y}", {"x": "a/b", "y": "c?d"}),
+            ("test://{path*}", {"path": "a/b/c"}),
+            ("test://pre/{rest*}", {"rest": "x y/z"}),
+        ],
+    )
+    def test_match_then_expand_recovers_params(
+        self, template: str, params: dict[str, str]
+    ):
+        """Expanding params and matching them back reproduces the original values."""
+        uri = expand_uri_template(template, params)
+        assert match_uri_template(uri, template) == params
+
+
+class TestTemplateMimeType:
+    """A template must serve the MIME type it advertises in listings."""
+
+    @pytest.mark.parametrize(
+        "declared,expected",
+        [
+            ("text/csv", "text/csv"),
+            ("text/html", "text/html"),
+            (None, "text/plain"),
+        ],
+    )
+    async def test_declared_mime_type_is_served_on_read(
+        self, declared: str | None, expected: str
+    ):
+        """A string return honors the template's declared mime_type."""
+        mcp = FastMCP()
+
+        kwargs = {"mime_type": declared} if declared else {}
+
+        @mcp.resource("data://report/{name}", **kwargs)
+        def report(name: str) -> str:
+            return f"col_a,col_b\n{name},1"
+
+        async with Client(mcp) as client:
+            result = await client.read_resource("data://report/x")
+
+        assert result[0].mime_type == expected
+
+    async def test_read_mime_type_matches_listed_mime_type(self):
+        """resources/templates/list and resources/read must agree."""
+        mcp = FastMCP()
+
+        @mcp.resource("data://item/{id}", mime_type="text/csv")
+        def item(id: str) -> str:
+            return f"id\n{id}"
+
+        async with Client(mcp) as client:
+            listed = await client.list_resource_templates()
+            read = await client.read_resource("data://item/7")
+
+        assert listed[0].mime_type == read[0].mime_type == "text/csv"
+
+    async def test_json_native_return_matches_concrete_resource(self):
+        """A dict return behaves the same for templates and concrete resources."""
+        mcp = FastMCP()
+
+        @mcp.resource("data://concrete")
+        def concrete() -> dict:
+            return {"k": 1}
+
+        @mcp.resource("data://templated/{id}")
+        def templated(id: str) -> dict:
+            return {"k": id}
+
+        async with Client(mcp) as client:
+            concrete_result = await client.read_resource("data://concrete")
+            templated_result = await client.read_resource("data://templated/1")
+
+        assert concrete_result[0].mime_type == templated_result[0].mime_type
+
+    async def test_component_meta_propagates_to_content(self):
+        """Template-level meta reaches content items, as it does for resources."""
+        mcp = FastMCP()
+
+        @mcp.resource("data://tagged/{id}", meta={"team": "infra"})
+        def tagged(id: str) -> str:
+            return id
+
+        async with Client(mcp) as client:
+            result = await client.read_resource("data://tagged/9")
+
+        assert result[0].meta is not None
+        assert result[0].meta["team"] == "infra"
+
+
+class TestInternalMetaNotLeaked:
+    """FastMCP's private visibility marker must never reach the wire."""
+
+    @pytest.mark.parametrize(
+        "uri,read_uri",
+        [
+            ("data://plain", "data://plain"),
+            ("data://tmpl/{id}", "data://tmpl/1"),
+        ],
+    )
+    async def test_visibility_marker_stripped_from_content_meta(
+        self, uri: str, read_uri: str
+    ):
+        """Applying a visibility rule must not add internal meta to content."""
+        mcp = FastMCP()
+
+        if "{" in uri:
+
+            @mcp.resource(uri)
+            def templated(id: str) -> str:
+                return id
+        else:
+
+            @mcp.resource(uri)
+            def concrete() -> str:
+                return "value"
+
+        # Applying any visibility rule stamps the internal marker on meta
+        mcp.enable(names={"templated" if "{" in uri else "concrete"})
+
+        async with Client(mcp) as client:
+            result = await client.read_resource(read_uri)
+
+        assert result[0].meta is None
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            TextResource(uri="data://text", name="text", text="value"),
+            BinaryResource(uri="data://binary", name="binary", data=b"value"),
+        ],
+    )
+    async def test_visibility_marker_stripped_from_static_resource_meta(
+        self, resource: TextResource | BinaryResource
+    ):
+        mcp = FastMCP()
+        mcp.add_resource(resource)
+        mcp.enable(names={str(resource.uri)})
+
+        async with Client(mcp) as client:
+            result = await client.read_resource(str(resource.uri))
+
+        assert result[0].meta is None
+
+    async def test_user_meta_survives_stripping(self):
+        """Only the internal namespace is removed; user meta is preserved."""
+        mcp = FastMCP()
+
+        @mcp.resource("data://tagged/{id}", meta={"team": "infra"})
+        def tagged(id: str) -> str:
+            return id
+
+        mcp.enable(names={"tagged"})
+
+        async with Client(mcp) as client:
+            result = await client.read_resource("data://tagged/1")
+
+        assert result[0].meta == {"team": "infra"}
+
+
+class TestLiteralEncoding:
+    """RFC 6570 section 3.1: literal template text is percent-encoded."""
+
+    @pytest.mark.parametrize(
+        "uri_template, expected",
+        [
+            # A literal the URI grammar does not allow is UTF-8 percent-encoded.
+            ("file:///docs/café/{name}", "file:///docs/caf%C3%A9/a.txt"),
+            ("file:///my docs/{name}", "file:///my%20docs/a.txt"),
+            # Reserved and unreserved characters are structural, so they stay.
+            ("file:///a-b_c~d.e/{name}", "file:///a-b_c~d.e/a.txt"),
+            # An already-encoded literal is not encoded twice.
+            ("file:///docs/caf%C3%A9/{name}", "file:///docs/caf%C3%A9/a.txt"),
+        ],
+    )
+    def test_expand_encodes_literals(self, uri_template: str, expected: str):
+        assert expand_uri_template(uri_template, {"name": "a.txt"}) == expected
+
+    @pytest.mark.parametrize(
+        "uri_template, uri",
+        [
+            ("file:///docs/café/{name}", "file:///docs/caf%C3%A9/a.txt"),
+            ("file:///my docs/{name}", "file:///my%20docs/a.txt"),
+        ],
+    )
+    def test_match_accepts_the_encoded_form(self, uri_template: str, uri: str):
+        """An AnyUrl percent-encodes the URI, so that is the form matching sees."""
+        assert match_uri_template(uri, uri_template) == {"name": "a.txt"}
+
+    def test_expand_match_roundtrip(self):
+        uri_template = "file:///docs/café/{name}"
+        expanded = expand_uri_template(uri_template, {"name": "a.txt"})
+        assert match_uri_template(expanded, uri_template) == {"name": "a.txt"}
+
+    async def test_template_with_non_ascii_literal_is_readable(self):
+        """Regression: the template was listed but every read returned Not Found."""
+        mcp = FastMCP("test")
+
+        @mcp.resource("file:///docs/café/{name}")
+        def doc(name: str) -> str:
+            return f"contents of {name}"
+
+        async with Client(mcp) as client:
+            templates = await client.list_resource_templates()
+            assert templates[0].uri_template == "file:///docs/café/{name}"
+
+            result = await client.read_resource("file:///docs/caf%C3%A9/a.txt")
+
+        assert result[0].text == "contents of a.txt"  # type: ignore[union-attr]
+
+
+class TestLiteralMatchingAcceptsRawAndEncodedForms:
+    """AnyUrl leaves some literal characters as written, and in-process reads skip it."""
+
+    @pytest.mark.parametrize(
+        "uri_template, uri",
+        [
+            ("data://pair/{a}|{b}", "data://pair/one|two"),
+            ("data://pct/100%/{a}", "data://pct/100%/one"),
+            ("data://caret/v^{a}", "data://caret/v^one"),
+            ("note:my notes/{a}", "note:my notes/one"),
+            ("data://docs/café/{a}", "data://docs/café/one"),
+        ],
+    )
+    async def test_read_through_client_and_in_process(
+        self, uri_template: str, uri: str
+    ):
+        mcp = FastMCP("test")
+
+        @mcp.resource(uri_template)
+        def read(a: str, b: str = "") -> str:
+            return f"{a}{b}"
+
+        async with Client(mcp) as client:
+            [contents] = await client.read_resource(uri)
+            assert isinstance(contents, TextResourceContents)
+            assert contents.text.startswith("one")
+
+        result = await mcp.read_resource(uri)
+        content = result.contents[0].content
+        assert isinstance(content, str) and content.startswith("one")
+
+    @pytest.mark.parametrize(
+        "uri",
+        ["data://docs/na%C3%AFve/one", "data://docs/na%c3%afve/one"],
+    )
+    def test_encoded_literal_matches_in_either_hex_case(self, uri: str):
+        assert match_uri_template(uri, "data://docs/naïve/{a}") == {"a": "one"}
+
+
+class TestNonExplodedListQueryParams:
+    """RFC 6570 3.2.8: a non-exploded `{?name}` list is one comma-joined value.
+
+    Separating commas are literal; a comma inside an item arrives as `%2C`.
+    """
+
+    @pytest.mark.parametrize(
+        "uri, expected",
+        [
+            ("items://books?tags=a,b", ["a", "b"]),
+            ("items://books?tags=a", ["a"]),
+            ("items://books?tags=a%2Cb,c", ["a,b", "c"]),
+            ("items://books?tags=caf%C3%A9,x%20y", ["café", "x y"]),
+            ("items://books?tags=", []),
+        ],
+    )
+    def test_match_splits_on_literal_commas(self, uri: str, expected: list[str]):
+        result = match_uri_template(
+            uri, "items://{category}{?tags}", list_params={"tags"}
+        )
+        assert result == {"category": "books", "tags": expected}
+
+    def test_match_without_list_params_keeps_scalar_values(self):
+        """A plain `{?q}` string keeps its commas, as on 4.0.5."""
+        assert match_uri_template("items://books?q=a,b", "items://{category}{?q}") == {
+            "category": "books",
+            "q": "a,b",
+        }
+
+    @pytest.mark.parametrize(
+        "tags, expected",
+        [
+            (["a", "b"], "items://books?tags=a,b"),
+            (["a,b", "c"], "items://books?tags=a%2Cb,c"),
+            ([], "items://books"),
+        ],
+    )
+    def test_expand_joins_list_with_literal_commas(self, tags, expected):
+        template = "items://{category}{?tags}"
+        uri = expand_uri_template(template, {"category": "books", "tags": tags})
+        assert uri == expected
+        if tags:
+            assert match_uri_template(uri, template, list_params={"tags"}) == {
+                "category": "books",
+                "tags": tags,
+            }
+
+    async def test_read_through_client(self):
+        mcp = FastMCP("test")
+
+        @mcp.resource("items://{category}{?tags,ids}")
+        def search(
+            category: str,
+            tags: list[str] = Field(default_factory=list),
+            ids: list[int] | None = None,
+        ) -> str:
+            return f"{category} {tags} {ids}"
+
+        async with Client(mcp) as client:
+            reads = {
+                "items://books": "books [] None",
+                "items://books?tags=a,b": "books ['a', 'b'] None",
+                "items://books?tags=a%2Cb&ids=1,2": "books ['a,b'] [1, 2]",
+            }
+            for uri, expected in reads.items():
+                [contents] = await client.read_resource(uri)
+                assert isinstance(contents, TextResourceContents)
+                assert contents.text == expected
+
+    @pytest.mark.parametrize("layer", ["mounted", "proxy"])
+    @pytest.mark.parametrize(
+        "query, expected",
+        [
+            ("?tags=a,b", "['a', 'b']"),
+            ("?tags=a%2Cb,c", "['a,b', 'c']"),
+            ("", "[]"),
+        ],
+    )
+    async def test_list_survives_mounts_and_proxies(self, layer, query, expected):
+        """Forwarding layers must pass the query through, not decode and re-encode it."""
+        child = FastMCP("child")
+
+        @child.resource("items://{category}{?tags}")
+        def search(category: str, tags: list[str] = Field(default_factory=list)) -> str:
+            return str(tags)
+
+        if layer == "mounted":
+            server = FastMCP("parent")
+            server.mount(child, namespace="ns")
+            uri = f"items://ns/books{query}"
+        else:
+            server = create_proxy(child)
+            uri = f"items://books{query}"
+
+        async with Client(server) as client:
+            [contents] = await client.read_resource(uri)
+            assert isinstance(contents, TextResourceContents)
+            assert contents.text == expected
+
+
+class TestTemplateComponentMetaPropagation:
+    """A template's component meta must reach list[ResourceContent] reads."""
+
+    async def test_list_resource_content_return_preserves_template_meta(self):
+        mcp = FastMCP()
+        component_meta = {"ui": {"csp": "default-src none"}, "team": "infra"}
+
+        @mcp.resource("data://multi/{id}", meta=component_meta)
+        def multi(id: str) -> list[ResourceContent]:
+            return [ResourceContent("a"), ResourceContent("b", meta={"own": 1})]
+
+        async with Client(mcp) as client:
+            result = await client.read_resource_mcp("data://multi/1")
+
+        assert [content.meta for content in result.contents] == [
+            component_meta,
+            {**component_meta, "own": 1},
+        ]

@@ -1,0 +1,898 @@
+"""Tests for fastmcp list and fastmcp call CLI commands."""
+
+import json
+import warnings
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import mcp_types
+import pytest
+from cryptography.fernet import Fernet
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+
+from fastmcp import FastMCP
+from fastmcp.cli import client as client_module
+from fastmcp.cli.client import (
+    Client,
+    _build_client,
+    _build_stdio_from_command,
+    _format_call_result_text,
+    _is_http_target,
+    _sanitize_untrusted_text,
+    _terminal_elicitation_handler,
+    call_command,
+    coerce_value,
+    format_tool_signature,
+    list_command,
+    parse_tool_arguments,
+    resolve_server_spec,
+)
+from fastmcp.client.auth.oauth import OAuth
+from fastmcp.client.client import CallToolResult
+from fastmcp.client.transports.http import StreamableHttpTransport
+from fastmcp.client.transports.sse import SSETransport
+from fastmcp.client.transports.stdio import StdioTransport
+from fastmcp.mcp_config import RemoteMCPServer
+from fastmcp.settings import Settings
+from fastmcp.utilities.tests import temporary_settings
+
+# ---------------------------------------------------------------------------
+# coerce_value
+# ---------------------------------------------------------------------------
+
+
+class TestCoerceValue:
+    def test_integer(self):
+        assert coerce_value("42", {"type": "integer"}) == 42
+
+    def test_integer_negative(self):
+        assert coerce_value("-7", {"type": "integer"}) == -7
+
+    def test_integer_invalid(self):
+        with pytest.raises(ValueError, match="Expected integer"):
+            coerce_value("abc", {"type": "integer"})
+
+    def test_number(self):
+        assert coerce_value("3.14", {"type": "number"}) == 3.14
+
+    def test_number_integer_value(self):
+        assert coerce_value("5", {"type": "number"}) == 5.0
+
+    def test_number_invalid(self):
+        with pytest.raises(ValueError, match="Expected number"):
+            coerce_value("xyz", {"type": "number"})
+
+    def test_boolean_true_variants(self):
+        for val in ("true", "True", "TRUE", "1", "yes"):
+            assert coerce_value(val, {"type": "boolean"}) is True
+
+    def test_boolean_false_variants(self):
+        for val in ("false", "False", "FALSE", "0", "no"):
+            assert coerce_value(val, {"type": "boolean"}) is False
+
+    def test_boolean_invalid(self):
+        with pytest.raises(ValueError, match="Expected boolean"):
+            coerce_value("maybe", {"type": "boolean"})
+
+    def test_array(self):
+        assert coerce_value("[1, 2, 3]", {"type": "array"}) == [1, 2, 3]
+
+    def test_array_invalid(self):
+        with pytest.raises(ValueError, match="Expected JSON array"):
+            coerce_value("not-json", {"type": "array"})
+
+    def test_object(self):
+        assert coerce_value('{"a": 1}', {"type": "object"}) == {"a": 1}
+
+    def test_string(self):
+        assert coerce_value("hello", {"type": "string"}) == "hello"
+
+    def test_string_default(self):
+        """Unknown or missing type treats value as string."""
+        assert coerce_value("hello", {}) == "hello"
+
+    def test_string_preserves_numeric_looking_values(self):
+        assert coerce_value("42", {"type": "string"}) == "42"
+
+    @pytest.mark.parametrize(
+        ("raw", "schema", "expected"),
+        [
+            ("[1, 2]", {"anyOf": [{"type": "array"}, {"type": "null"}]}, [1, 2]),
+            ('{"a": 1}', {"anyOf": [{"type": "null"}, {"type": "object"}]}, {"a": 1}),
+            ("42", {"anyOf": [{"type": "integer"}, {"type": "null"}]}, 42),
+            ("true", {"anyOf": [{"type": "boolean"}, {"type": "null"}]}, True),
+            ("[1, 2]", {"type": ["array", "null"]}, [1, 2]),
+            ("42", {"anyOf": [{"type": "string"}, {"type": "null"}]}, "42"),
+        ],
+    )
+    def test_optional_uses_non_null_type(self, raw, schema, expected):
+        """``X | None`` is coerced like ``X``."""
+        result = coerce_value(raw, schema)
+        assert result == expected
+        assert type(result) is type(expected)
+
+    def test_optional_invalid_value(self):
+        with pytest.raises(ValueError, match="Expected JSON array"):
+            coerce_value("not-json", {"anyOf": [{"type": "array"}, {"type": "null"}]})
+
+    @pytest.mark.parametrize(
+        "schema",
+        [
+            {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+            {"anyOf": [{"type": "integer"}, {"type": "string"}, {"type": "null"}]},
+            {"type": ["integer", "string"]},
+        ],
+    )
+    def test_ambiguous_union_stays_string(self, schema):
+        assert coerce_value("42", schema) == "42"
+
+
+# ---------------------------------------------------------------------------
+# parse_tool_arguments
+# ---------------------------------------------------------------------------
+
+
+class TestParseToolArguments:
+    SCHEMA: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"},
+            "limit": {"type": "integer"},
+            "verbose": {"type": "boolean"},
+        },
+        "required": ["query"],
+    }
+
+    def test_basic_key_value(self):
+        result = parse_tool_arguments(("query=hello", "limit=10"), None, self.SCHEMA)
+        assert result == {"query": "hello", "limit": 10}
+
+    def test_input_json_only(self):
+        result = parse_tool_arguments((), '{"query": "hello", "limit": 5}', self.SCHEMA)
+        assert result == {"query": "hello", "limit": 5}
+
+    def test_key_value_overrides_input_json(self):
+        result = parse_tool_arguments(
+            ("limit=20",), '{"query": "hello", "limit": 5}', self.SCHEMA
+        )
+        assert result == {"query": "hello", "limit": 20}
+
+    def test_value_containing_equals(self):
+        result = parse_tool_arguments(("query=a=b=c",), None, self.SCHEMA)
+        assert result == {"query": "a=b=c"}
+
+    def test_optional_array_parsed_as_json(self):
+        schema: dict[str, Any] = {
+            "type": "object",
+            "properties": {
+                "tags": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string"}},
+                        {"type": "null"},
+                    ],
+                    "default": None,
+                },
+            },
+        }
+        result = parse_tool_arguments(('tags=["a", "b"]',), None, schema)
+        assert result == {"tags": ["a", "b"]}
+
+    def test_invalid_arg_format_exits(self):
+        with pytest.raises(SystemExit):
+            parse_tool_arguments(("noequalssign",), None, self.SCHEMA)
+
+    def test_invalid_input_json_exits(self):
+        with pytest.raises(SystemExit):
+            parse_tool_arguments((), "not-valid-json", self.SCHEMA)
+
+    def test_input_json_non_object_exits(self):
+        with pytest.raises(SystemExit):
+            parse_tool_arguments((), "[1,2,3]", self.SCHEMA)
+
+    def test_single_json_object_as_positional(self):
+        result = parse_tool_arguments(
+            ('{"query": "hello", "limit": 5}',), None, self.SCHEMA
+        )
+        assert result == {"query": "hello", "limit": 5}
+
+    def test_json_positional_ignored_when_input_json_set(self):
+        """When --input-json is already provided, a JSON positional arg is not special."""
+        with pytest.raises(SystemExit):
+            parse_tool_arguments(('{"limit": 99}',), '{"query": "hello"}', self.SCHEMA)
+
+    def test_coercion_error_exits(self):
+        with pytest.raises(SystemExit):
+            parse_tool_arguments(("limit=abc",), None, self.SCHEMA)
+
+
+# ---------------------------------------------------------------------------
+# format_tool_signature
+# ---------------------------------------------------------------------------
+
+
+class TestFormatToolSignature:
+    def _make_tool(
+        self,
+        name: str = "my_tool",
+        properties: dict[str, Any] | None = None,
+        required: list[str] | None = None,
+        output_schema: dict[str, Any] | None = None,
+        description: str | None = None,
+    ) -> mcp_types.Tool:
+        input_schema: dict[str, Any] = {"type": "object"}
+        if properties is not None:
+            input_schema["properties"] = properties
+        if required is not None:
+            input_schema["required"] = required
+        return mcp_types.Tool(
+            name=name,
+            description=description,
+            input_schema=input_schema,
+            output_schema=output_schema,
+        )
+
+    def test_no_params(self):
+        tool = self._make_tool()
+        assert format_tool_signature(tool) == "my_tool()"
+
+    def test_required_param(self):
+        tool = self._make_tool(
+            properties={"query": {"type": "string"}},
+            required=["query"],
+        )
+        assert format_tool_signature(tool) == "my_tool(query: str)"
+
+    def test_optional_param_with_default(self):
+        tool = self._make_tool(
+            properties={"limit": {"type": "integer", "default": 10}},
+        )
+        assert format_tool_signature(tool) == "my_tool(limit: int = 10)"
+
+    def test_optional_param_without_default(self):
+        tool = self._make_tool(
+            properties={"limit": {"type": "integer"}},
+        )
+        assert format_tool_signature(tool) == "my_tool(limit: int = ...)"
+
+    def test_mixed_required_and_optional(self):
+        tool = self._make_tool(
+            properties={
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 10},
+            },
+            required=["query"],
+        )
+        sig = format_tool_signature(tool)
+        assert sig == "my_tool(query: str, limit: int = 10)"
+
+    def test_with_output_schema(self):
+        tool = self._make_tool(
+            properties={"q": {"type": "string"}},
+            required=["q"],
+            output_schema={"type": "object"},
+        )
+        assert format_tool_signature(tool) == "my_tool(q: str) -> dict"
+
+    def test_anyof_type(self):
+        tool = self._make_tool(
+            properties={"value": {"anyOf": [{"type": "string"}, {"type": "integer"}]}},
+            required=["value"],
+        )
+        assert format_tool_signature(tool) == "my_tool(value: str | int)"
+
+
+# ---------------------------------------------------------------------------
+# resolve_server_spec
+# ---------------------------------------------------------------------------
+
+
+class TestResolveServerSpec:
+    def test_http_url(self):
+        assert (
+            resolve_server_spec("http://localhost:8000/mcp")
+            == "http://localhost:8000/mcp"
+        )
+
+    def test_https_url(self):
+        assert (
+            resolve_server_spec("https://example.com/mcp") == "https://example.com/mcp"
+        )
+
+    def test_python_file_existing(self, tmp_path: Path):
+        py_file = tmp_path / "server.py"
+        py_file.write_text("# empty")
+        result = resolve_server_spec(str(py_file))
+        assert isinstance(result, StdioTransport)
+        assert result.command == "fastmcp"
+        assert result.args == ["run", str(py_file.resolve()), "--no-banner"]
+
+    def test_json_mcp_config(self, tmp_path: Path):
+        config_file = tmp_path / "mcp.json"
+        config = {"mcpServers": {"test": {"url": "http://localhost:8000"}}}
+        config_file.write_text(json.dumps(config))
+        result = resolve_server_spec(str(config_file))
+        assert isinstance(result, dict)
+        assert "mcpServers" in result
+
+    def test_json_fastmcp_config_exits(self, tmp_path: Path):
+        config_file = tmp_path / "fastmcp.json"
+        config_file.write_text(json.dumps({"source": {"type": "file"}}))
+        with pytest.raises(SystemExit):
+            resolve_server_spec(str(config_file))
+
+    def test_json_not_found_exits(self, tmp_path: Path):
+        with pytest.raises(SystemExit):
+            resolve_server_spec(str(tmp_path / "nonexistent.json"))
+
+    def test_directory_exits(self, tmp_path: Path):
+        """Directories should not be treated as file paths."""
+        with pytest.raises(SystemExit):
+            resolve_server_spec(str(tmp_path))
+
+    def test_unrecognised_exits(self):
+        with pytest.raises(SystemExit):
+            resolve_server_spec("some_random_thing")
+
+    def test_command_returns_stdio_transport(self):
+        result = resolve_server_spec(None, command="npx -y @mcp/server")
+        assert isinstance(result, StdioTransport)
+        assert result.command == "npx"
+        assert result.args == ["-y", "@mcp/server"]
+
+    def test_command_single_word(self):
+        result = resolve_server_spec(None, command="myserver")
+        assert isinstance(result, StdioTransport)
+        assert result.command == "myserver"
+        assert result.args == []
+
+    def test_server_spec_and_command_exits(self):
+        with pytest.raises(SystemExit):
+            resolve_server_spec("http://localhost:8000", command="npx server")
+
+    def test_neither_server_spec_nor_command_exits(self):
+        with pytest.raises(SystemExit):
+            resolve_server_spec(None)
+
+    def test_transport_sse_rewrites_url(self):
+        result = resolve_server_spec("http://localhost:8000/mcp", transport="sse")
+        assert isinstance(result, SSETransport)
+        assert result.url == "http://localhost:8000/mcp/sse"
+
+    def test_transport_sse_no_duplicate_suffix(self):
+        result = resolve_server_spec("http://localhost:8000/sse", transport="sse")
+        assert isinstance(result, SSETransport)
+        assert result.url == "http://localhost:8000/sse"
+
+    def test_transport_sse_trailing_slash(self):
+        result = resolve_server_spec("http://localhost:8000/mcp/", transport="sse")
+        assert isinstance(result, SSETransport)
+        assert result.url == "http://localhost:8000/mcp/sse"
+
+    def test_transport_http_leaves_url_unchanged(self):
+        result = resolve_server_spec("http://localhost:8000/mcp", transport="http")
+        assert isinstance(result, StreamableHttpTransport)
+        assert result.url == "http://localhost:8000/mcp"
+
+    @pytest.mark.parametrize("transport", ["http", "sse"])
+    def test_explicit_transport_preserves_query_and_fragment(self, transport):
+        result = resolve_server_spec(
+            "https://example.test/mcp?token=abc#section", transport=transport
+        )
+        if transport == "sse":
+            assert isinstance(result, SSETransport)
+            assert result.url == "https://example.test/mcp/sse?token=abc#section"
+        else:
+            assert isinstance(result, StreamableHttpTransport)
+            assert result.url == "https://example.test/mcp?token=abc#section"
+
+    def test_explicit_http_overrides_sse_path(self):
+        result = resolve_server_spec("https://example.test/sse", transport="http")
+        assert isinstance(result, StreamableHttpTransport)
+        assert result.url == "https://example.test/sse"
+
+    def test_no_explicit_transport_preserves_inference(self):
+        assert resolve_server_spec("https://example.test/sse?token=abc") == (
+            "https://example.test/sse?token=abc"
+        )
+
+
+# ---------------------------------------------------------------------------
+# _build_stdio_from_command
+# ---------------------------------------------------------------------------
+
+
+class TestBuildStdioFromCommand:
+    def test_simple_command(self):
+        transport = _build_stdio_from_command("uvx my-server")
+        assert transport.command == "uvx"
+        assert transport.args == ["my-server"]
+
+    def test_quoted_args(self):
+        transport = _build_stdio_from_command("npx -y '@scope/server'")
+        assert transport.command == "npx"
+        assert transport.args == ["-y", "@scope/server"]
+
+    def test_empty_command_exits(self):
+        with pytest.raises(SystemExit):
+            _build_stdio_from_command("")
+
+    def test_invalid_shell_syntax_exits(self):
+        with pytest.raises(SystemExit):
+            _build_stdio_from_command("npx 'unterminated")
+
+
+# ---------------------------------------------------------------------------
+# _is_http_target
+# ---------------------------------------------------------------------------
+
+
+class TestIsHttpTarget:
+    def test_http_url(self):
+        assert _is_http_target("http://localhost:8000") is True
+
+    def test_https_url(self):
+        assert _is_http_target("https://example.com/mcp") is True
+
+    def test_file_path(self):
+        assert _is_http_target("/path/to/server.py") is False
+
+    def test_stdio_transport(self):
+        assert _is_http_target(StdioTransport(command="npx", args=[])) is False
+
+    def test_mcp_config_dict(self):
+        """MCPConfig dicts are not HTTP targets — auth is per-server internally."""
+        assert _is_http_target({"mcpServers": {}}) is False
+
+
+# ---------------------------------------------------------------------------
+# _build_client
+# ---------------------------------------------------------------------------
+
+
+class TestBuildClient:
+    @pytest.mark.parametrize("transport,auth", [("http", None), ("sse", "oauth")])
+    async def test_encrypted_oauth_reused_by_fresh_client(
+        self,
+        transport: str,
+        auth: str | None,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv(
+            "FASTMCP_OAUTH_ENCRYPTION_KEY", Fernet.generate_key().decode()
+        )
+        url = (
+            "https://example.com/mcp"
+            if transport == "http"
+            else "https://example.com/sse"
+        )
+        resolved = url if transport == "http" else SSETransport(url)
+        tokens = OAuthToken(
+            access_token="synthetic-access-token",
+            refresh_token="synthetic-refresh-token",
+            token_type="Bearer",
+            expires_in=300,
+        )
+        registration = OAuthClientInformationFull(
+            client_id="test-client",
+            client_secret="synthetic-registration-secret",
+            redirect_uris=["http://localhost/callback"],
+        )
+
+        with temporary_settings(**Settings(home=tmp_path, _env_file=None).model_dump()):
+            with warnings.catch_warnings(record=True) as emitted:
+                warnings.simplefilter("always")
+                # py-key-value-aio checks a non-runtime-checkable protocol on Python 3.15.
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"<class 'key_value\.aio\.protocols\.key_value\.AsyncKeyValue'> isn't explicitly decorated",
+                    category=DeprecationWarning,
+                )
+                first = _build_client(resolved, auth=auth).transport.auth
+                assert isinstance(first, OAuth)
+                await first.token_storage_adapter.set_tokens(tokens)
+                await first.token_storage_adapter.set_client_info(registration)
+                second = _build_client(resolved, auth=auth).transport.auth
+                assert isinstance(second, OAuth)
+
+            assert await second.token_storage_adapter.get_tokens() == tokens
+            assert await second.token_storage_adapter.get_client_info() == registration
+            assert await second.token_storage_adapter.get_token_expiry() == (
+                await first.token_storage_adapter.get_token_expiry()
+            )
+            other = _build_client("https://example.com/other").transport.auth
+            assert isinstance(other, OAuth)
+            assert await other.token_storage_adapter.get_tokens() is None
+
+        assert not emitted
+        files = [path for path in tmp_path.rglob("*") if path.is_file()]
+        assert files
+        for path in files:
+            contents = path.read_bytes()
+            for secret in (
+                tokens.access_token,
+                tokens.refresh_token,
+                registration.client_secret,
+            ):
+                assert secret is not None
+                assert secret.encode() not in contents
+
+    @pytest.mark.parametrize("key", [None, ""])
+    async def test_unconfigured_oauth_is_quiet_and_ephemeral(
+        self,
+        key: str | None,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        if key is None:
+            monkeypatch.delenv("FASTMCP_OAUTH_ENCRYPTION_KEY", raising=False)
+        else:
+            monkeypatch.setenv("FASTMCP_OAUTH_ENCRYPTION_KEY", key)
+
+        with temporary_settings(**Settings(home=tmp_path, _env_file=None).model_dump()):
+            with warnings.catch_warnings(record=True) as emitted:
+                warnings.simplefilter("always")
+                first = _build_client("https://example.com/mcp").transport.auth
+                second = _build_client("https://example.com/mcp").transport.auth
+            assert not emitted
+            assert isinstance(first, OAuth) and isinstance(second, OAuth)
+            await first.token_storage_adapter.set_tokens(
+                OAuthToken(access_token="ephemeral-token", token_type="Bearer")
+            )
+            assert await second.token_storage_adapter.get_tokens() is None
+            assert not list(tmp_path.iterdir())
+            with pytest.warns(UserWarning, match="Using in-memory token storage"):
+                OAuth("https://example.com/mcp")
+
+    async def test_changed_key_does_not_reuse_encrypted_tokens(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        original_key = Fernet.generate_key().decode()
+        monkeypatch.setenv("FASTMCP_OAUTH_ENCRYPTION_KEY", original_key)
+        with temporary_settings(**Settings(home=tmp_path, _env_file=None).model_dump()):
+            first = _build_client("https://example.com/mcp").transport.auth
+            assert isinstance(first, OAuth)
+            await first.token_storage_adapter.set_tokens(
+                OAuthToken(access_token="original-key-token", token_type="Bearer")
+            )
+
+        monkeypatch.setenv(
+            "FASTMCP_OAUTH_ENCRYPTION_KEY", Fernet.generate_key().decode()
+        )
+        with temporary_settings(**Settings(home=tmp_path, _env_file=None).model_dump()):
+            changed = _build_client("https://example.com/mcp").transport.auth
+            assert isinstance(changed, OAuth)
+            assert await changed.token_storage_adapter.get_tokens() is None
+            await changed.token_storage_adapter.set_tokens(
+                OAuthToken(access_token="changed-key-token", token_type="Bearer")
+            )
+
+        monkeypatch.setenv("FASTMCP_OAUTH_ENCRYPTION_KEY", original_key)
+        with temporary_settings(**Settings(home=tmp_path, _env_file=None).model_dump()):
+            restored = _build_client("https://example.com/mcp").transport.auth
+            assert isinstance(restored, OAuth)
+            tokens = await restored.token_storage_adapter.get_tokens()
+            assert tokens is not None and tokens.access_token == "original-key-token"
+
+    @pytest.mark.parametrize("auth", ["none", "synthetic-bearer-token"])
+    def test_unused_invalid_key_does_not_break_explicit_auth(
+        self, auth: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("FASTMCP_OAUTH_ENCRYPTION_KEY", "invalid-key")
+        with temporary_settings(**Settings(home=tmp_path, _env_file=None).model_dump()):
+            _build_client("https://example.com/mcp", auth=auth)
+
+    def test_http_target_gets_oauth_by_default(self):
+        client = _build_client("http://localhost:8000/mcp")
+        # OAuth is applied during Client init via _set_auth
+        assert client.transport.auth is not None
+
+    def test_stdio_target_no_auth(self):
+        transport = StdioTransport(command="npx", args=["-y", "@mcp/server"])
+        client = _build_client(transport)
+        # Stdio transports don't support auth — no auth should be set
+        assert not hasattr(client.transport, "auth") or client.transport.auth is None
+
+    def test_explicit_auth_none_disables_oauth(self):
+        client = _build_client("http://localhost:8000/mcp", auth="none")
+        # "none" explicitly disables auth, even for HTTP targets
+        assert client.transport.auth is None
+
+    def test_mcp_config_no_auth(self):
+        """MCPConfig dicts handle auth per-server; no top-level auth applied."""
+        client = _build_client({"mcpServers": {"test": {"url": "http://localhost"}}})
+        # MCPConfigTransport doesn't support _set_auth — no crash means success
+        assert client.transport is not None
+
+
+@pytest.mark.parametrize("command", ["list", "call"])
+async def test_invalid_oauth_key_is_a_cli_error(
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("FASTMCP_OAUTH_ENCRYPTION_KEY", "invalid-key")
+    with temporary_settings(**Settings(home=tmp_path, _env_file=None).model_dump()):
+        with pytest.raises(SystemExit) as exc_info:
+            if command == "list":
+                await list_command("https://example.com/mcp")
+            else:
+                await call_command("https://example.com/mcp", "greet")
+    assert exc_info.value.code == 1
+    output = capsys.readouterr()
+    assert "FASTMCP_OAUTH_ENCRYPTION_KEY" in output.out
+    assert "Fernet" in output.out
+    assert "invalid-key" not in output.out + output.err
+    assert "Traceback" not in output.out + output.err
+
+
+def test_named_oauth_server_is_quiet(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    server = client_module.DiscoveredServer(
+        name="weather",
+        source="project",
+        config=RemoteMCPServer(url="https://example.com/mcp", auth="oauth"),
+        config_path=tmp_path / "mcp.json",
+    )
+    monkeypatch.setattr(
+        "fastmcp.cli.discovery.discover_servers", lambda start_dir: [server]
+    )
+    monkeypatch.delenv("FASTMCP_OAUTH_ENCRYPTION_KEY", raising=False)
+    with temporary_settings(**Settings(home=tmp_path, _env_file=None).model_dump()):
+        with warnings.catch_warnings(record=True) as emitted:
+            warnings.simplefilter("always")
+            _build_client(resolve_server_spec("weather"))
+    assert not emitted
+
+
+# ---------------------------------------------------------------------------
+# Integration tests — invoke actual CLI commands via monkeypatched _build_client
+# ---------------------------------------------------------------------------
+
+
+def _build_test_server() -> FastMCP:
+    """Create a minimal FastMCP server for integration tests."""
+    server = FastMCP("TestServer")
+
+    @server.tool
+    def greet(name: str) -> str:
+        """Say hello to someone."""
+        return f"Hello, {name}!"
+
+    @server.tool
+    def add(a: int, b: int) -> int:
+        """Add two numbers."""
+        return a + b
+
+    @server.tool
+    def total(values: list[int] | None = None) -> int:
+        """Sum an optional list of numbers."""
+        return sum(values or [])
+
+    @server.resource("test://greeting")
+    def greeting_resource() -> str:
+        """A static greeting resource."""
+        return "Hello from resource!"
+
+    @server.prompt
+    def ask(topic: str) -> str:
+        """Ask about a topic."""
+        return f"Tell me about {topic}"
+
+    return server
+
+
+@pytest.fixture()
+def _patch_client():
+    """Patch resolve_server_spec and _build_client so CLI commands use the
+    in-process test server without needing a real transport."""
+    server = _build_test_server()
+
+    def fake_resolve(server_spec: Any, **kwargs: Any) -> str:
+        return "fake"
+
+    def fake_build_client(resolved: Any, **kwargs: Any) -> Client:
+        return Client(server)
+
+    with (
+        patch.object(client_module, "resolve_server_spec", side_effect=fake_resolve),
+        patch.object(client_module, "_build_client", side_effect=fake_build_client),
+    ):
+        yield
+
+
+class TestListCommandCLI:
+    @pytest.mark.usefixtures("_patch_client")
+    async def test_list_tools(self, capsys: pytest.CaptureFixture[str]):
+        await list_command("fake://server")
+        captured = capsys.readouterr()
+        assert "greet" in captured.out
+        assert "add" in captured.out
+
+    @pytest.mark.usefixtures("_patch_client")
+    async def test_list_json(self, capsys: pytest.CaptureFixture[str]):
+        await list_command("fake://server", json_output=True)
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        names = {t["name"] for t in data["tools"]}
+        assert "greet" in names
+        assert "add" in names
+
+    @pytest.mark.usefixtures("_patch_client")
+    async def test_list_resources(self, capsys: pytest.CaptureFixture[str]):
+        await list_command("fake://server", resources=True)
+        captured = capsys.readouterr()
+        assert "test://greeting" in captured.out
+
+    @pytest.mark.usefixtures("_patch_client")
+    async def test_list_prompts(self, capsys: pytest.CaptureFixture[str]):
+        await list_command("fake://server", prompts=True)
+        captured = capsys.readouterr()
+        assert "ask" in captured.out
+
+
+class TestCallCommandCLI:
+    @pytest.mark.usefixtures("_patch_client")
+    async def test_call_tool(self, capsys: pytest.CaptureFixture[str]):
+        await call_command("fake://server", "greet", "name=World")
+        captured = capsys.readouterr()
+        assert "Hello, World!" in captured.out
+
+    @pytest.mark.usefixtures("_patch_client")
+    async def test_call_tool_json(self, capsys: pytest.CaptureFixture[str]):
+        await call_command("fake://server", "greet", "name=World", json_output=True)
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert data["is_error"] is False
+
+    @pytest.mark.usefixtures("_patch_client")
+    async def test_call_tool_optional_array(self, capsys: pytest.CaptureFixture[str]):
+        await call_command(
+            "fake://server", "total", "values=[1, 2, 3]", json_output=True
+        )
+        data = json.loads(capsys.readouterr().out)
+        assert data["is_error"] is False
+        assert data["structured_content"] == {"result": 6}
+
+    @pytest.mark.usefixtures("_patch_client")
+    async def test_call_tool_not_found(self):
+        with pytest.raises(SystemExit):
+            await call_command("fake://server", "nonexistent")
+
+    @pytest.mark.usefixtures("_patch_client")
+    async def test_call_tool_missing_args(self):
+        with pytest.raises(SystemExit):
+            await call_command("fake://server", "greet")
+
+    @pytest.mark.usefixtures("_patch_client")
+    async def test_call_resource_by_uri(self, capsys: pytest.CaptureFixture[str]):
+        await call_command("fake://server", "test://greeting")
+        captured = capsys.readouterr()
+        assert "Hello from resource!" in captured.out
+
+    @pytest.mark.usefixtures("_patch_client")
+    async def test_call_resource_json(self, capsys: pytest.CaptureFixture[str]):
+        await call_command("fake://server", "test://greeting", json_output=True)
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert isinstance(data, list)
+        assert data[0]["text"] == "Hello from resource!"
+
+    @pytest.mark.usefixtures("_patch_client")
+    async def test_call_prompt(self, capsys: pytest.CaptureFixture[str]):
+        await call_command("fake://server", "ask", "topic=Python", prompt=True)
+        captured = capsys.readouterr()
+        assert "Python" in captured.out
+
+    @pytest.mark.usefixtures("_patch_client")
+    async def test_call_prompt_json(self, capsys: pytest.CaptureFixture[str]):
+        await call_command(
+            "fake://server", "ask", "topic=Python", prompt=True, json_output=True
+        )
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert "messages" in data
+
+    @pytest.mark.usefixtures("_patch_client")
+    async def test_call_prompt_not_found(self):
+        with pytest.raises(SystemExit):
+            await call_command("fake://server", "nonexistent", prompt=True)
+
+    async def test_call_missing_target(self):
+        with pytest.raises(SystemExit):
+            await call_command("fake://server", "")
+
+
+# ---------------------------------------------------------------------------
+# Structured content serialization
+# ---------------------------------------------------------------------------
+
+
+class TestFormatCallResult:
+    def test_structured_content_uses_dict_not_data(
+        self, capsys: pytest.CaptureFixture[str]
+    ):
+        """structured_content (raw dict) is used for display, not data (which may
+        be a non-serializable dataclass)."""
+        result = CallToolResult(
+            content=[mcp_types.TextContent(type="text", text="ok")],
+            structured_content={"key": "value"},
+            meta=None,
+            data=object(),  # non-serializable on purpose
+            is_error=False,
+        )
+        # Should not raise — uses structured_content, not data
+        _format_call_result_text(result)
+        captured = capsys.readouterr()
+        assert "value" in captured.out
+
+    def test_escapes_rich_markup_and_control_chars(
+        self, capsys: pytest.CaptureFixture[str]
+    ):
+        result = CallToolResult(
+            content=[mcp_types.TextContent(type="text", text="[red]x[/red]\x1b[2J")],
+            structured_content=None,
+            meta=None,
+            data=None,
+            is_error=False,
+        )
+
+        _format_call_result_text(result)
+        captured = capsys.readouterr()
+        assert "[red]x[/red]" in captured.out
+        assert "\\x1b" in captured.out
+        assert "\x1b" not in captured.out
+
+
+class TestSanitizeUntrustedText:
+    def test_sanitize_untrusted_text(self):
+        value = "[bold]hello[/bold]\x07"
+        sanitized = _sanitize_untrusted_text(value)
+        assert sanitized == "\\[bold]hello\\[/bold]\\x07"
+
+
+class TestTerminalElicitationHandler:
+    @pytest.fixture(autouse=True)
+    def _press_enter(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr("builtins.input", lambda *args: "")
+
+    @staticmethod
+    def _params(message: str, field: dict[str, Any], name: str = "answer"):
+        return mcp_types.ElicitRequestFormParams(
+            message=message,
+            requested_schema={"type": "object", "properties": {name: field}},
+        )
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Deploy to production? [y/N]",
+            "Branch to deploy [main]",
+            "Tag format is v[/]MAJOR",
+        ],
+    )
+    async def test_message_is_printed_verbatim(
+        self, message: str, capsys: pytest.CaptureFixture[str]
+    ):
+        result = await _terminal_elicitation_handler(
+            message, None, self._params(message, {"type": "string"}), None
+        )
+
+        assert result.action == "accept"
+        assert f"Server asks: {message}" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        ("field_name", "field_type"),
+        [("name[bold]", "string"), ("tag", "string[/]")],
+    )
+    async def test_field_prompt_is_printed_verbatim(
+        self, field_name: str, field_type: str, capsys: pytest.CaptureFixture[str]
+    ):
+        params = self._params("Pick one", {"type": field_type}, name=field_name)
+
+        await _terminal_elicitation_handler("Pick one", None, params, None)
+
+        assert f"  {field_name} ({field_type}): " in capsys.readouterr().out

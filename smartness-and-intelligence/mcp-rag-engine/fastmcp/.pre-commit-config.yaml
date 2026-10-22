@@ -1,0 +1,70 @@
+fail_fast: false
+
+repos:
+  - repo: https://github.com/abravalheri/validate-pyproject
+    rev: v0.24.1
+    hooks:
+      - id: validate-pyproject
+
+  - repo: https://github.com/rbubley/mirrors-prettier
+    rev: v3.8.4
+    hooks:
+      - id: prettier
+        types_or: [yaml, json5]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Ruff version.
+    rev: v0.14.10
+    hooks:
+      # Run the linter.
+      - id: ruff-check
+        args: [--fix, --exit-non-zero-on-fix]
+      # Run the formatter.
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty check
+        entry: uv run --isolated ty check
+        language: system
+        types: [python]
+        files: ^fastmcp_slim/|^tests/|^examples/
+        pass_filenames: false
+        require_serial: true
+
+      - id: loq
+        name: loq (file size limits)
+        entry: bash -c 'uv run loq || printf "\nloq violations not enforced... yet!\n"'
+        language: system
+        pass_filenames: false
+        verbose: true
+
+      - id: gitleaks
+        name: gitleaks (secret scanning)
+        # Full working-tree scan rather than the official `gitleaks git --staged`
+        # hook: that mode fingerprints findings by commit SHA, which would
+        # churn a fingerprint-based ignore list on every unrelated commit to
+        # an ignored file. .gitleaks.toml's allowlist is matched against the
+        # detected secret text instead, so it's stable regardless of commit
+        # or line number. Its path allowlist also excludes local build
+        # artifacts (e.g. __pycache__), which `--no-git` doesn't consult
+        # .gitignore for. Requires gitleaks on PATH (e.g. `brew install
+        # gitleaks`).
+        entry: gitleaks detect --source . --no-git --config .gitleaks.toml --redact -v
+        language: system
+        pass_filenames: false
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: no-commit-to-branch
+        name: prevent commits to main
+        args: [--branch, main]
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell # See pyproject.toml for args
+        additional_dependencies:
+          - tomli
